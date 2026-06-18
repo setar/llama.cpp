@@ -1308,6 +1308,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--checkpoint-dir"}, "PATH",
+        "directory for on-disk checkpoint swap - stores context checkpoints on disk instead of RAM"
+        " (default: empty = disabled, example: /tmp/llama_ckpt)"
+        "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)",
+        [](common_params & params, const std::string & value) {
+            params.checkpoint_cache_dir = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_DIR").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--checkpoint-disk-limit"}, "N",
+        string_format("max on-disk checkpoint cache size in MiB (default: %d = unlimited)"
+            " - old checkpoints are evicted LRU when the limit is exceeded)", params.checkpoint_disk_limit_mib),
+        [](common_params & params, int value) {
+            params.checkpoint_disk_limit_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_DISK_LIMIT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

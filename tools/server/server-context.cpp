@@ -16,11 +16,17 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cinttypes>
+#include <condition_variable>
+#include <deque>
 #include <exception>
-#include <memory>
 #include <filesystem>
+#include <fstream>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <utility>
 
 // fix problem with std::min and std::max
@@ -51,6 +57,7 @@ static server_prompt_checkpoint server_get_checkpoint(llama_context * ctx, int i
         /*.pos_max  = */ pos_max,
         /*.n_tokens = */ n_tokens,
         /*.data     = */ std::vector<uint8_t>(checkpoint_size),
+        /*.filepath = */ "",
     };
 
     const size_t n = llama_state_seq_get_data_ext(ctx, cur.data.data(), checkpoint_size, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -689,6 +696,13 @@ private:
 
     server_metrics metrics;
 
+    // Checkpoint disk swap writer thread
+    std::thread ckpt_writer_thread;
+    std::mutex  ckpt_queue_mutex;
+    std::condition_variable ckpt_queue_cv;
+    std::deque<server_prompt_checkpoint> ckpt_write_queue;
+    std::atomic<bool> ckpt_writer_running{false};
+
     json json_webui_settings = json::object();
 
     // Necessary similarity of prompt for slot selection
@@ -701,6 +715,15 @@ private:
     bool sleeping = false;
 
     void destroy() {
+        // Stop checkpoint writer first
+        stop_ckpt_writer();
+
+        // Clean up checkpoint files from disk
+        if (!params_base.checkpoint_cache_dir.empty()) {
+            std::error_code ec;
+            std::filesystem::remove_all(params_base.checkpoint_cache_dir, ec);
+        }
+
         llama_init.reset();
 
         ctx = nullptr;
@@ -727,6 +750,200 @@ private:
         slot.prompt_save(*prompt_cache);
         slot.prompt_clear(false);
         prompt_cache->update();
+    }
+
+    //
+    // Checkpoint disk swap — writer thread and helpers
+    //
+
+    // Build checkpoint file path from its metadata
+    static std::string checkpoint_filepath(const std::string & dir, int slot_id, const server_prompt_checkpoint & cp) {
+        return dir + "/ckpt_" + std::to_string(slot_id) + "_"
+               + std::to_string(cp.pos_min) + "_"
+               + std::to_string(cp.pos_max) + "_"
+               + std::to_string(cp.n_tokens) + ".bin";
+    }
+
+    static bool checkpoint_filepath_from_meta(const std::string & dir, int slot_id, llama_pos pos_min, llama_pos pos_max, int64_t n_tokens) {
+        std::string path = dir + "/ckpt_" + std::to_string(slot_id) + "_"
+               + std::to_string(pos_min) + "_"
+               + std::to_string(pos_max) + "_"
+               + std::to_string(n_tokens) + ".bin";
+        return std::filesystem::exists(path);
+    }
+
+    // Write a single checkpoint to disk (blocking I/O — called from writer thread)
+    static bool write_checkpoint_to_disk(const std::string & filepath, const std::vector<uint8_t> & data) {
+        std::ofstream fout(filepath, std::ios::binary);
+        if (!fout) {
+            return false;
+        }
+        fout.write(reinterpret_cast<const char *>(data.data()), data.size());
+        return fout.good();
+    }
+
+    // Read a checkpoint from disk into data vector (blocking I/O — called from main thread during restore)
+    static bool read_checkpoint_from_disk(const std::string & filepath, std::vector<uint8_t> & data) {
+        std::ifstream fin(filepath, std::ios::binary | std::ios::ate);
+        if (!fin) {
+            return false;
+        }
+        size_t file_size = fin.tellg();
+        data.resize(file_size);
+        fin.seekg(0);
+        fin.read(reinterpret_cast<char *>(data.data()), file_size);
+        return fin.good();
+    }
+
+    // Remove stale checkpoint files from disk
+    static void remove_checkpoint_file(const std::string & filepath) {
+        if (!filepath.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(filepath, ec);
+        }
+    }
+
+    // Remove all checkpoint files for a specific slot from the cache directory
+    void cleanup_slot_checkpoint_files(int slot_id, const std::string & dir) {
+        if (dir.empty()) {
+            return;
+        }
+        std::error_code ec;
+        auto prefix = std::string("ckpt_") + std::to_string(slot_id) + "_";
+        for (auto & entry : std::filesystem::directory_iterator(dir, ec)) {
+            if (entry.is_regular_file() && entry.path().filename().string().find(prefix) == 0) {
+                std::filesystem::remove(entry.path(), ec);
+            }
+        }
+    }
+
+    // Clear checkpoint files from slot's checkpoint list
+    void remove_slot_checkpoints_from_disk(server_slot & slot) {
+        if (params_base.checkpoint_cache_dir.empty()) {
+            return;
+        }
+        for (auto & cp : slot.prompt.checkpoints) {
+            remove_checkpoint_file(cp.filepath);
+        }
+    }
+
+    // LRU eviction: keep total checkpoint disk usage <= limit
+    // We accumulate sizes incrementally and only scan on mismatch > 10%
+    void enforce_checkpoint_disk_limit() {
+        if (params_base.checkpoint_disk_limit_mib == 0 || params_base.checkpoint_cache_dir.empty()) {
+            return;
+        }
+        const auto limit_bytes = (size_t) params_base.checkpoint_disk_limit_mib * 1024 * 1024;
+
+        // Collect all checkpoint files, sorted by slot_id then pos_min (oldest first)
+        std::error_code ec;
+        std::vector<std::filesystem::directory_entry> ckpt_files;
+        size_t total_size = 0;
+
+        for (auto & entry : std::filesystem::directory_iterator(params_base.checkpoint_cache_dir, ec)) {
+            if (entry.is_regular_file() && entry.path().filename().string().find("ckpt_") == 0) {
+                ckpt_files.push_back(entry);
+                total_size += entry.file_size();
+            }
+        }
+
+        // Remove oldest (smallest pos_min) until under limit
+        // Sort by filename (which starts with slot_pos_min_pos_max, so lexicographic ≈ chronological)
+        std::sort(ckpt_files.begin(), ckpt_files.end(),
+            [](const auto & a, const auto & b) {
+                return a.path().filename().string() < b.path().filename().string();
+            });
+
+        for (const auto & entry : ckpt_files) {
+            if (total_size <= limit_bytes) {
+                break;
+            }
+            auto sz = entry.file_size(ec);
+            std::filesystem::remove(entry.path(), ec);
+            if (!ec) {
+                total_size -= sz;
+            }
+        }
+    }
+
+    // Start background checkpoint writer thread
+    void start_ckpt_writer() {
+        if (ckpt_writer_running.exchange(true)) {
+            return; // already running
+        }
+        ckpt_writer_thread = std::thread([this]() {
+            // Set thread name for debugging
+            pthread_setname_np("ckpt-writer");
+
+            while (true) {
+                server_prompt_checkpoint cp;
+                {
+                    std::unique_lock<std::mutex> lock(ckpt_queue_mutex);
+                    ckpt_queue_cv.wait(lock, [this]() {
+                        return !ckpt_write_queue.empty() || !ckpt_writer_running.load();
+                    });
+                    if (!ckpt_writer_running.load() && ckpt_write_queue.empty()) {
+                        return; // shutdown
+                    }
+                    cp = std::move(ckpt_write_queue.front());
+                    ckpt_write_queue.pop_front();
+                }
+
+                if (!cp.filepath.empty() && !cp.data.empty()) {
+                    // Ensure directory exists
+                    std::error_code ec;
+                    std::filesystem::create_directories(
+                        std::filesystem::path(cp.filepath).parent_path(), ec);
+
+                    bool ok = write_checkpoint_to_disk(cp.filepath, cp.data);
+                    if (ok) {
+                        // All good — clear data to free RAM
+                        cp.data.clear();
+                        cp.data.shrink_to_fit();
+                    } else {
+                        SRV_WRN("failed to write checkpoint to disk: %s (will keep in RAM)\n", cp.filepath.c_str());
+                        // Keep data in RAM as fallback — it stays in the checkpoint list
+                    }
+                }
+            }
+        });
+    }
+
+    // Stop background checkpoint writer thread
+    void stop_ckpt_writer() {
+        if (!ckpt_writer_running.exchange(false)) {
+            return; // not running
+        }
+        {
+            std::lock_guard<std::mutex> lock(ckpt_queue_mutex);
+            ckpt_queue_cv.notify_one();
+        }
+        if (ckpt_writer_thread.joinable()) {
+            ckpt_writer_thread.join();
+        }
+        // Clear any remaining write queue items
+        std::lock_guard<std::mutex> lock(ckpt_queue_mutex);
+        ckpt_write_queue.clear();
+    }
+
+    // Enqueue a checkpoint for disk write
+    void enqueue_ckpt_write(server_prompt_checkpoint cp) {
+        if (!ckpt_writer_running.load()) {
+            // Writer not running — try synchronous write
+            std::error_code ec;
+            std::filesystem::create_directories(
+                std::filesystem::path(cp.filepath).parent_path(), ec);
+            if (write_checkpoint_to_disk(cp.filepath, cp.data)) {
+                cp.data.clear();
+                cp.data.shrink_to_fit();
+            }
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(ckpt_queue_mutex);
+            ckpt_write_queue.push_back(std::move(cp));
+        }
+        ckpt_queue_cv.notify_one();
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -966,6 +1183,11 @@ private:
 
         // propagate new defaults back to caller
         params = params_base;
+
+        // start checkpoint writer if disk swap is configured
+        if (!params_base.checkpoint_cache_dir.empty()) {
+            start_ckpt_writer();
+        }
 
         if (!is_resume) {
             return init();
@@ -1818,22 +2040,34 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
-        while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
+        while (params_base.n_ctx_checkpoints > 0 && slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
             const auto & cur = slot.prompt.checkpoints.front();
 
+            // Remove disk file if the checkpoint was swapped to disk
+            remove_checkpoint_file(cur.filepath);
+
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.data.size() / 1024 / 1024);
+                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) (cur.filepath.empty() ? cur.data.size() : 0) / 1024 / 1024);
 
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
-        const auto & cur = slot.prompt.checkpoints.emplace_back(server_get_checkpoint(ctx, slot.id, slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max));
+        auto & cur = slot.prompt.checkpoints.emplace_back(server_get_checkpoint(ctx, slot.id, slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max));
+
+        // If disk swap is enabled, ship the data to the writer thread and free RAM
+        const bool use_disk = !params_base.checkpoint_cache_dir.empty();
+        if (use_disk) {
+            cur.filepath = checkpoint_filepath(params_base.checkpoint_cache_dir, slot.id, cur);
+            enqueue_ckpt_write(cur); // moves data into writer queue, clears cur.data
+            enforce_checkpoint_disk_limit();
+        }
 
         SLT_WRN(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB%s)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.data.size() / 1024 / 1024);
+                cur.pos_max, cur.n_tokens, (float) cur.data.size() / 1024 / 1024,
+                use_disk ? " [disk]" : "");
     }
 
     void process_single_task(server_task && task) {
@@ -2072,6 +2306,11 @@ private:
                     const size_t n_erased = slot->prompt.tokens.size();
 
                     slot->prompt_clear(false);
+
+                    // Clean up checkpoint files on disk for this slot
+                    remove_slot_checkpoints_from_disk(*slot);
+                    slot->prompt.checkpoints.clear();
+
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
                     res->id       = task.id;
@@ -2491,6 +2730,17 @@ private:
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
+                                    // If checkpoint is on disk, load it into RAM first
+                                    if (!do_reset && it->data.empty() && !it->filepath.empty()) {
+                                        std::vector<uint8_t> disk_data;
+                                        if (read_checkpoint_from_disk(it->filepath, disk_data)) {
+                                            const_cast<server_prompt_checkpoint &>(*it).data = std::move(disk_data);
+                                        } else {
+                                            SLT_WRN(slot, "failed to read checkpoint from disk: %s\n", it->filepath.c_str());
+                                            do_reset = true;
+                                        }
+                                    }
+
                                     if (!do_reset) {
                                         // restore the context checkpoint
                                         const size_t checkpoint_size = it->data.size();
@@ -2522,6 +2772,7 @@ private:
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next) {
                                         SLT_WRN(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.data.size() / 1024 / 1024);
+                                        remove_checkpoint_file(cur.filepath);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
@@ -2584,7 +2835,7 @@ private:
                         alora_disabled_id = enabled_loras[0];
                     }
 
-                    bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
+                    bool do_checkpoint = params_base.n_ctx_checkpoints > 0 || !params_base.checkpoint_cache_dir.empty();
 
                     // make checkpoints only for completion tasks
                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;

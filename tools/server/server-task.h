@@ -573,12 +573,16 @@ struct server_prompt_checkpoint {
 
     std::vector<uint8_t> data;
 
+    // if non-empty, the checkpoint data is stored on disk
+    // the .data vector is cleared after writing to disk and the filepath is set
+    std::string filepath;
+
     size_t size() const {
         return data.size();
     }
 
     bool empty() const {
-        return data.empty();
+        return data.empty() && filepath.empty();
     }
 
     void clear() {
@@ -586,6 +590,7 @@ struct server_prompt_checkpoint {
         pos_max = 0;
         n_tokens = 0;
         data.clear();
+        filepath.clear();
     }
 };
 

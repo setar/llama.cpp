@@ -576,6 +576,9 @@ struct common_params {
     int32_t checkpoint_every_nt = 8192;  // make a checkpoint every n tokens during prefill
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
+    std::string checkpoint_cache_dir      = "";   // directory for on-disk checkpoint swap (empty = disabled)
+    int32_t     checkpoint_disk_limit_mib = 0;    // max on-disk checkpoint cache size in MiB (0 = unlimited)
+
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
