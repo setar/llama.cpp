@@ -2057,6 +2057,10 @@ private:
 
         // If disk swap is enabled, ship the data to the writer thread and free RAM
         const bool use_disk = !params_base.checkpoint_cache_dir.empty();
+
+        // Capture size before potential data clear below, so the log is accurate
+        const float checkpoint_size_mib = (float) cur.data.size() / 1024 / 1024;
+
         if (use_disk) {
             cur.filepath = checkpoint_filepath(params_base.checkpoint_cache_dir, slot.id, cur);
             enqueue_ckpt_write(cur); // sends a copy to the writer thread
@@ -2071,7 +2075,7 @@ private:
         SLT_WRN(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB%s)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.data.size() / 1024 / 1024,
+                cur.pos_max, cur.n_tokens, checkpoint_size_mib,
                 use_disk ? " [disk]" : "");
     }
 
