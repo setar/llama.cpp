@@ -2059,7 +2059,12 @@ private:
         const bool use_disk = !params_base.checkpoint_cache_dir.empty();
         if (use_disk) {
             cur.filepath = checkpoint_filepath(params_base.checkpoint_cache_dir, slot.id, cur);
-            enqueue_ckpt_write(cur); // moves data into writer queue, clears cur.data
+            enqueue_ckpt_write(cur); // sends a copy to the writer thread
+            // Free the original data in the slot's checkpoint list now,
+            // regardless of whether the writer processed the copy yet or not.
+            // On restore, the main thread will load it back from disk.
+            cur.data.clear();
+            cur.data.shrink_to_fit();
             enforce_checkpoint_disk_limit();
         }
 
