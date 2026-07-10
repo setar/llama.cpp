@@ -915,6 +915,21 @@ typedef struct {
 } ggml_metal_kargs_lightning_indexer;
 
 typedef struct {
+    int32_t n_expert;
+    int32_t n_expert_used;
+    int32_t n_tokens;
+    float   clamp_min;
+    float   scale;
+} ggml_metal_kargs_topk_moe_sqrtsoftplus;
+
+typedef struct {
+    int32_t n_expert_used;
+    int32_t n_tokens;
+    float   clamp_min;
+    float   scale;
+} ggml_metal_kargs_moe_sum_norm_scale;
+
+typedef struct {
     int64_t  ne00;
     int64_t  ne01;
     int64_t  ne02;

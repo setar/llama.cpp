@@ -2130,16 +2130,20 @@ struct test_glu_split : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
     int v; // view (1 : non-contiguous a)
+    float clamp_limit;
 
     std::string vars() override {
-        return VARS_TO_STR3(type, ne_a, v) + ",split";
+        return VARS_TO_STR4(type, ne_a, v, clamp_limit) + ",split";
     }
 
     test_glu_split(ggml_glu_op op,
             ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne_a = {128, 2, 2, 2},
-            int v = 0)
-        : op(op), type(type), ne_a(ne_a), v(v) {}
+            int v = 0,
+            float clamp_limit = 0.0f)
+        : op(op), type(type), ne_a(ne_a), v(v), clamp_limit(clamp_limit) {}
+
+    bool run_whole_graph() override { return clamp_limit > 0.0f; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a;
@@ -2167,6 +2171,12 @@ struct test_glu_split : public test_case {
             b = ggml_new_tensor(ctx, type, 4, ne_a.data());
             ggml_set_param(b);
             ggml_set_name(b, "b");
+        }
+
+        if (clamp_limit > 0.0f) {
+            GGML_ASSERT(op == GGML_GLU_OP_SWIGLU);
+            b = ggml_clamp(ctx, b, -clamp_limit, clamp_limit);
+            a = ggml_clamp(ctx, a, -INFINITY, clamp_limit);
         }
 
         ggml_tensor * out = ggml_glu_split(ctx, a, b, op);
@@ -6023,6 +6033,10 @@ struct test_topk_moe : public test_case {
             (gating_func == GATING_FUNC_SOFTMAX) ? ggml_soft_max(ctx, logits) :
             (gating_func == GATING_FUNC_SIGMOID) ? ggml_sigmoid(ctx, logits) :
             (gating_func == GATING_FUNC_SQRT_SOFTPLUS) ? ggml_sqrt(ctx, ggml_softplus(ctx, logits)) : logits;
+            (gating_func == GATING_FUNC_SIGMOID) ? ggml_sigmoid(ctx, logits) : logits;
+        if (gating_func == GATING_FUNC_SQRT_SOFTPLUS) {
+            probs = ggml_sqrt(ctx, ggml_softplus(ctx, logits));
+        }
         ggml_set_name(probs, "probs");
 
         ggml_tensor * selection_probs = probs;
@@ -8123,6 +8137,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // DeepSeek-V4 limited SwiGLU: clamp up and gate before the split GLU.
+    test_cases.emplace_back(new test_glu_split(
+        GGML_GLU_OP_SWIGLU, GGML_TYPE_F32, {256, 6, 1, 1}, 0, 7.0f));
+
     for (int v : {0, 1}) {
         for (float alpha : {.5f, 1.702f}) {
             for (float limit : {2.0f, 7.0f}) {
@@ -9704,6 +9722,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // DeepSeek-V4 decode routing shape. Metal fuses this full routing chain.
+    test_cases.emplace_back(new test_topk_moe(
+        {256, 1, 1, 1}, 6, true, true, GATING_FUNC_SQRT_SOFTPLUS, 1.5f));
+
+    // Decode-sized normalization shape without the full routing pattern. This
+    // exercises SUM_ROWS -> CLAMP -> DIV -> SCALE fusion independently.
+    test_cases.emplace_back(new test_topk_moe(
+        {32, 1, 1, 1}, 6, true, false, GATING_FUNC_SIGMOID, 1.5f));
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));

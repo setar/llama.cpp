@@ -1564,8 +1564,13 @@ kernel void kernel_swiglu(
     device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig*args.nb1);
 
     for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
-        const float x0 = src0_row[i0];
-        const float x1 = src1_row[i0];
+        float x0 = src0_row[i0];
+        float x1 = src1_row[i0];
+
+        if (args.limit > 0.0f) {
+            x0 = min(x0, args.limit);
+            x1 = clamp(x1, -args.limit, args.limit);
+        }
 
         const float silu = x0 / (1.0f + exp(-x0));
 
@@ -2460,6 +2465,91 @@ typedef decltype(kernel_lightning_indexer<float, float4>) kernel_lightning_index
 
 template [[host_name("kernel_lightning_indexer_f32")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<float, float4>;
 template [[host_name("kernel_lightning_indexer_f16")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<half,  half4>;
+
+kernel void kernel_topk_moe_sqrtsoftplus_f32(
+        constant ggml_metal_kargs_topk_moe_sqrtsoftplus & args,
+        device const float   * logits,
+        device const float   * bias,
+        device       int32_t * ids,
+        device       float   * weights,
+        uint token [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr int values_per_lane = 8;
+    constexpr int simd_width       = 32;
+    constexpr int top_k            = 6;
+
+    float routing_weights[values_per_lane];
+    float selection_weights[values_per_lane];
+
+    for (int i = 0; i < values_per_lane; ++i) {
+        const int expert = lane + i*simd_width;
+        const float x = logits[token*args.n_expert + expert];
+        float p = sqrt(select(log(1.0f + exp(x)), x, x > 20.0f));
+        p = isnan(p) ? -FLT_MAX : p;
+        routing_weights[i]   = p;
+        selection_weights[i] = p + bias[expert];
+    }
+
+    float selected_weights[top_k];
+    float sum = 0.0f;
+
+    for (int k = 0; k < top_k; ++k) {
+        float local_max = -INFINITY;
+        uint local_idx = UINT_MAX;
+        int local_slot = -1;
+
+        for (int i = 0; i < values_per_lane; ++i) {
+            const uint expert = lane + i*simd_width;
+            const float value = selection_weights[i];
+            if (value > local_max || (value == local_max && expert < local_idx)) {
+                local_max  = value;
+                local_idx  = expert;
+                local_slot = i;
+            }
+        }
+
+        const float global_max = simd_max(local_max);
+        const uint candidate_idx = local_max == global_max ? local_idx : UINT_MAX;
+        const uint global_idx = simd_min(candidate_idx);
+
+        float selected_weight = 0.0f;
+        if (local_idx == global_idx) {
+            selected_weight = routing_weights[local_slot];
+            selection_weights[local_slot] = -INFINITY;
+        }
+        selected_weight = simd_sum(selected_weight);
+
+        if (lane == 0) {
+            ids[token*args.n_expert_used + k] = (int32_t) global_idx;
+            selected_weights[k] = selected_weight;
+            sum += selected_weight;
+        }
+    }
+
+    if (lane == 0) {
+        const float norm = max(sum, args.clamp_min);
+        for (int k = 0; k < top_k; ++k) {
+            weights[token*args.n_expert_used + k] = selected_weights[k] * args.scale / norm;
+        }
+    }
+}
+
+kernel void kernel_moe_sum_norm_scale_f32(
+        constant ggml_metal_kargs_moe_sum_norm_scale & args,
+        device const float * weights,
+        device       float * output,
+        uint token [[threadgroup_position_in_grid]]) {
+    const uint offset = token*args.n_expert_used;
+    float sum = 0.0f;
+    for (int i = 0; i < args.n_expert_used; ++i) {
+        sum += weights[offset + i];
+    }
+
+    const float factor = args.scale/max(sum, args.clamp_min);
+    for (int i = 0; i < args.n_expert_used; ++i) {
+        output[offset + i] = weights[offset + i]*factor;
+    }
+}
 
 kernel void kernel_ssm_conv_f32_f32(
         constant ggml_metal_kargs_ssm_conv & args,
