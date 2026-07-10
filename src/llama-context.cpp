@@ -155,7 +155,7 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
-    cparams.moe_hot_count     = params.moe_hot_count;
+    cparams.moe_hot_count     = 0;
 
     cparams.ctx_other = nullptr;
 
@@ -516,9 +516,25 @@ static std::string llama_moe_expert_stats_path(const llama_model & model) {
     return dir + "/expert_" + safe + ".bin";
 }
 
+static bool llama_moe_expert_tensor_has_experts(const ggml_tensor * t, uint32_t n_expert) {
+    return t != nullptr && n_expert > 0 && t->ne[2] == n_expert;
+}
+
+static bool llama_moe_expert_tensor_is_host_backed(const ggml_tensor * t, uint32_t n_expert) {
+    return llama_moe_expert_tensor_has_experts(t, n_expert) &&
+        t->data != nullptr && t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer);
+}
+
 void llama_context::init_moe_hot(const llama_context_params & params) {
     const auto & hparams = model.hparams;
+    cparams.moe_hot_count = 0;
+    if (params.moe_hot_count == 0) {
+        return;
+    }
+
     if (hparams.n_expert <= 0 || hparams.n_layer() == 0) {
+        LLAMA_LOG_WARN("%s: --moe-hot-count requested but model has no MoE expert metadata (n_expert = %" PRIu32 ", n_layer = %" PRIu32 ")\n",
+                __func__, hparams.n_expert, hparams.n_layer());
         return;
     }
 
@@ -542,18 +558,60 @@ void llama_context::init_moe_hot(const llama_context_params & params) {
         moe_hot_count = *std::max_element(moe_hot_per_layer.begin(), moe_hot_per_layer.end());
     }
 
+    int32_t n_expert_tensors = 0;
+    int32_t n_host_expert_tensors = 0;
+    for (const auto & layer : model.layers) {
+        const ggml_tensor * tensors[] = {
+            layer.ffn_gate_exps,
+            layer.ffn_up_exps,
+            layer.ffn_down_exps,
+            layer.ffn_gate_up_exps,
+        };
+        for (const ggml_tensor * t : tensors) {
+            if (llama_moe_expert_tensor_has_experts(t, hparams.n_expert)) {
+                ++n_expert_tensors;
+                if (llama_moe_expert_tensor_is_host_backed(t, hparams.n_expert)) {
+                    ++n_host_expert_tensors;
+                }
+            }
+        }
+    }
+
+    if (n_expert_tensors > 0 && n_host_expert_tensors == 0) {
+        LLAMA_LOG_WARN("%s: --moe-hot-count requested but disabled; expert tensors are not host-backed (for example, all layers are offloaded), host-backed expert tensors %d/%d\n",
+                __func__, n_host_expert_tensors, n_expert_tensors);
+        moe_hot_count = 0;
+        moe_auto_mode = false;
+        moe_hot_per_layer.clear();
+        return;
+    }
+    if (n_host_expert_tensors == 0) {
+        LLAMA_LOG_WARN("%s: --moe-hot-count requested but disabled; no expert tensors matched n_expert = %" PRIu32 "\n",
+                __func__, hparams.n_expert);
+        moe_hot_count = 0;
+        moe_auto_mode = false;
+        moe_hot_per_layer.clear();
+        return;
+    }
+
     expert_counts.assign(hparams.n_layer(), std::vector<uint64_t>(hparams.n_expert, 0));
     load_expert_stats_default();
     reclassify_moe_experts();
+    cparams.moe_hot_count = moe_hot_count;
 
     const int32_t hot_min = *std::min_element(moe_hot_per_layer.begin(), moe_hot_per_layer.end());
     const int32_t hot_max = *std::max_element(moe_hot_per_layer.begin(), moe_hot_per_layer.end());
-    LLAMA_LOG_INFO("%s: MoE hot experts enabled, per-layer hot count range [%d, %d]\n", __func__, hot_min, hot_max);
+    LLAMA_LOG_INFO("%s: MoE hot experts enabled, per-layer hot count range [%d, %d], host-backed expert tensors %d/%d\n",
+            __func__, hot_min, hot_max, n_host_expert_tensors, n_expert_tensors);
+    if (n_host_expert_tensors < n_expert_tensors) {
+        LLAMA_LOG_WARN("%s: MoE hot residency applies only to host-backed expert tensors; offloaded experts are not dynamically paged\n",
+                __func__);
+    }
 }
 
 void llama_context::touch_moe_expert_tensor(ggml_tensor * t, const std::vector<uint32_t> & sorted, int32_t hot_count) const {
     const auto & hparams = model.hparams;
-    if (t == nullptr || t->data == nullptr || hparams.n_expert <= 0 || t->ne[2] != hparams.n_expert) {
+    if (!llama_moe_expert_tensor_is_host_backed(t, hparams.n_expert)) {
         return;
     }
 
@@ -739,6 +797,9 @@ void llama_context::update_moe_hot_auto() {
     }
 
     moe_hot_count = *std::max_element(moe_hot_per_layer.begin(), moe_hot_per_layer.end());
+    if (cparams.moe_hot_count != 0) {
+        cparams.moe_hot_count = moe_hot_count;
+    }
 }
 
 llama_context::~llama_context() {
