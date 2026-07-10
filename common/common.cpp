@@ -2116,11 +2116,12 @@ bool common_prompt_batch_decode(
 }
 
 size_t common_prompt_checkpoint::size() const {
-    return data_tgt.size() + data_dft.size() + data_spec.size();
+    const size_t size_mem = data_tgt.size() + data_dft.size() + data_spec.size();
+    return size_mem > 0 ? size_mem : size_disk;
 }
 
 bool common_prompt_checkpoint::empty() const {
-    return data_tgt.empty();
+    return data_tgt.empty() && filepath.empty();
 }
 
 void common_prompt_checkpoint::clear() {
@@ -2132,6 +2133,8 @@ void common_prompt_checkpoint::clear() {
     data_tgt.clear();
     data_dft.clear();
     data_spec.clear();
+    filepath.clear();
+    size_disk = 0;
 }
 
 void common_prompt_checkpoint::update_pos(

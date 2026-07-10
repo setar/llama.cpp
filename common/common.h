@@ -618,6 +618,8 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    std::string checkpoint_cache_dir;    // directory for on-disk checkpoint swap (empty = disabled)
+    int32_t checkpoint_disk_limit_mib = 0; // max on-disk checkpoint cache size in MiB (0 = unlimited)
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
@@ -1131,6 +1133,9 @@ struct common_prompt_checkpoint {
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
+
+    std::string filepath;
+    size_t size_disk = 0;
 
     size_t size() const;
 

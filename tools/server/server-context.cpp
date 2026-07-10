@@ -986,6 +986,8 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        cleanup_checkpoint_files();
+
         spec.reset();
         spec_init.reset();
 
@@ -999,6 +1001,134 @@ private:
 
         mtmd_free(mctx);
         mctx = nullptr;
+    }
+
+    static std::string checkpoint_filepath(const std::string & dir, int slot_id, const common_prompt_checkpoint & cp) {
+        return dir + "/ckpt_" + std::to_string(slot_id) + "_"
+            + std::to_string(cp.pos_min) + "_"
+            + std::to_string(cp.pos_max) + "_"
+            + std::to_string(cp.n_tokens) + ".bin";
+    }
+
+    static bool write_checkpoint_to_disk(const std::string & filepath, const common_prompt_checkpoint & cp) {
+        std::ofstream fout(filepath, std::ios::binary);
+        if (!fout) {
+            return false;
+        }
+
+        const uint32_t magic = 0x31504b43; // CKP1
+        const uint64_t size_tgt  = cp.data_tgt.size();
+        const uint64_t size_dft  = cp.data_dft.size();
+        const uint64_t size_spec = cp.data_spec.size();
+
+        fout.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
+        fout.write(reinterpret_cast<const char *>(&size_tgt), sizeof(size_tgt));
+        fout.write(reinterpret_cast<const char *>(&size_dft), sizeof(size_dft));
+        fout.write(reinterpret_cast<const char *>(&size_spec), sizeof(size_spec));
+        fout.write(reinterpret_cast<const char *>(cp.data_tgt.data()),  cp.data_tgt.size());
+        fout.write(reinterpret_cast<const char *>(cp.data_dft.data()),  cp.data_dft.size());
+        fout.write(reinterpret_cast<const char *>(cp.data_spec.data()), cp.data_spec.size());
+
+        return fout.good();
+    }
+
+    static bool read_checkpoint_from_disk(common_prompt_checkpoint & cp) {
+        if (cp.filepath.empty()) {
+            return false;
+        }
+
+        std::ifstream fin(cp.filepath, std::ios::binary);
+        if (!fin) {
+            return false;
+        }
+
+        uint32_t magic = 0;
+        uint64_t size_tgt = 0;
+        uint64_t size_dft = 0;
+        uint64_t size_spec = 0;
+
+        fin.read(reinterpret_cast<char *>(&magic), sizeof(magic));
+        fin.read(reinterpret_cast<char *>(&size_tgt), sizeof(size_tgt));
+        fin.read(reinterpret_cast<char *>(&size_dft), sizeof(size_dft));
+        fin.read(reinterpret_cast<char *>(&size_spec), sizeof(size_spec));
+        if (!fin || magic != 0x31504b43) {
+            return false;
+        }
+
+        cp.data_tgt.resize(size_tgt);
+        cp.data_dft.resize(size_dft);
+        cp.data_spec.resize(size_spec);
+        fin.read(reinterpret_cast<char *>(cp.data_tgt.data()),  cp.data_tgt.size());
+        fin.read(reinterpret_cast<char *>(cp.data_dft.data()),  cp.data_dft.size());
+        fin.read(reinterpret_cast<char *>(cp.data_spec.data()), cp.data_spec.size());
+
+        return fin.good();
+    }
+
+    static void clear_checkpoint_ram(common_prompt_checkpoint & cp) {
+        cp.data_tgt.clear();
+        cp.data_tgt.shrink_to_fit();
+        cp.data_dft.clear();
+        cp.data_dft.shrink_to_fit();
+        cp.data_spec.clear();
+        cp.data_spec.shrink_to_fit();
+    }
+
+    static void remove_checkpoint_file(const std::string & filepath) {
+        if (!filepath.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(filepath, ec);
+        }
+    }
+
+    void cleanup_checkpoint_files() {
+        if (params_base.checkpoint_cache_dir.empty()) {
+            return;
+        }
+
+        std::error_code ec;
+        for (auto & entry : std::filesystem::directory_iterator(params_base.checkpoint_cache_dir, ec)) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+            if (entry.path().filename().string().find("ckpt_") == 0) {
+                std::filesystem::remove(entry.path(), ec);
+            }
+        }
+    }
+
+    void enforce_checkpoint_disk_limit() {
+        if (params_base.checkpoint_disk_limit_mib == 0 || params_base.checkpoint_cache_dir.empty()) {
+            return;
+        }
+
+        const size_t limit_bytes = (size_t) params_base.checkpoint_disk_limit_mib * 1024 * 1024;
+        std::error_code ec;
+        std::vector<std::filesystem::directory_entry> files;
+        size_t total_size = 0;
+
+        for (auto & entry : std::filesystem::directory_iterator(params_base.checkpoint_cache_dir, ec)) {
+            if (!entry.is_regular_file() || entry.path().filename().string().find("ckpt_") != 0) {
+                continue;
+            }
+            files.push_back(entry);
+            total_size += entry.file_size(ec);
+        }
+
+        std::sort(files.begin(), files.end(), [](const auto & a, const auto & b) {
+            return a.path().filename().string() < b.path().filename().string();
+        });
+
+        for (const auto & entry : files) {
+            if (total_size <= limit_bytes) {
+                break;
+            }
+            const size_t size = entry.file_size(ec);
+            std::filesystem::remove(entry.path(), ec);
+            if (!ec && total_size >= size) {
+                total_size -= size;
+            }
+        }
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -1060,6 +1190,19 @@ private:
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
+
+        if (!params_base.checkpoint_cache_dir.empty()) {
+            std::error_code ec;
+            std::filesystem::create_directories(params_base.checkpoint_cache_dir, ec);
+            if (ec) {
+                SRV_ERR("failed to create checkpoint directory '%s': %s\n",
+                        params_base.checkpoint_cache_dir.c_str(), ec.message().c_str());
+                return false;
+            }
+            cleanup_checkpoint_files();
+            SRV_INF("checkpoint disk swap enabled, dir = %s, limit = %d MiB\n",
+                    params_base.checkpoint_cache_dir.c_str(), params_base.checkpoint_disk_limit_mib);
+        }
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
@@ -2373,6 +2516,7 @@ private:
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
+            remove_checkpoint_file(cur.filepath);
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
@@ -2390,10 +2534,27 @@ private:
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
+        const size_t size_created = cur.size();
+        if (!params_base.checkpoint_cache_dir.empty()) {
+            cur.filepath = checkpoint_filepath(params_base.checkpoint_cache_dir, slot.id, cur);
+
+            std::error_code ec;
+            std::filesystem::create_directories(std::filesystem::path(cur.filepath).parent_path(), ec);
+            if (!ec && write_checkpoint_to_disk(cur.filepath, cur)) {
+                cur.size_disk = size_created;
+                clear_checkpoint_ram(cur);
+                enforce_checkpoint_disk_limit();
+            } else {
+                SLT_WRN(slot, "failed to write context checkpoint to disk: %s, keeping it in RAM\n", cur.filepath.c_str());
+                cur.filepath.clear();
+                cur.size_disk = 0;
+            }
+        }
+
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                cur.pos_max, cur.n_tokens, (float) size_created / 1024 / 1024);
     }
 
     void process_single_task(server_task && task) {
@@ -3358,15 +3519,30 @@ private:
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
                                     if (!do_reset) {
-                                        // restore the context checkpoint
-                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        // restore the draft's speculative state
-                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+                                        auto & ckpt = *it;
+                                        if (ckpt.data_tgt.empty() && !ckpt.filepath.empty()) {
+                                            if (!read_checkpoint_from_disk(ckpt)) {
+                                                SLT_WRN(slot, "failed to restore context checkpoint from disk: %s\n", ckpt.filepath.c_str());
+                                                do_reset = true;
+                                            }
+                                        }
+                                    }
 
-                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                    if (!do_reset) {
+                                        auto & ckpt = *it;
+                                        // restore the context checkpoint
+                                        ckpt.load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        // restore the draft's speculative state
+                                        common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
+
+                                        pos_next = std::min(pos_next, std::max(ckpt.pos_min + 1, ckpt.pos_max));
+                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) ckpt.n_tokens);
+                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", ckpt.pos_min, ckpt.pos_max, ckpt.n_tokens, n_past, (float) ckpt.size() / 1024 / 1024);
+
+                                        if (!ckpt.filepath.empty()) {
+                                            clear_checkpoint_ram(ckpt);
+                                        }
                                     }
 
                                     if (do_reset) {
@@ -3384,6 +3560,7 @@ private:
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                        remove_checkpoint_file(cur.filepath);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
