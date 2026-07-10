@@ -725,12 +725,22 @@ void llama_context::collect_moe_stats(const llm_graph_result * res, const llama_
     }
 
     moe_token_counter += ubatch.n_tokens;
-    constexpr int64_t MOE_RECLASSIFY_INTERVAL = 256;
-    if (moe_token_counter < MOE_RECLASSIFY_INTERVAL) {
+    // Reclassifying touches every expert tensor and is disproportionately
+    // expensive during prompt ingestion. Decode keeps the shorter interval;
+    // any prompt remainder triggers a final update on the first decode token.
+    constexpr int64_t MOE_RECLASSIFY_INTERVAL_DECODE = 256;
+    constexpr int64_t MOE_RECLASSIFY_INTERVAL_PROMPT = 8192;
+    const int64_t interval = ubatch.n_tokens > 1
+        ? MOE_RECLASSIFY_INTERVAL_PROMPT
+        : MOE_RECLASSIFY_INTERVAL_DECODE;
+    if (moe_token_counter < interval) {
         return;
     }
 
-    moe_token_counter = 0;
+    // Prompt batches keep their overshoot. On the prompt-to-decode transition,
+    // consume the accumulated prompt remainder as one update and start a fresh
+    // decode interval instead of causing a second update a few tokens later.
+    moe_token_counter = ubatch.n_tokens > 1 ? moe_token_counter % interval : 0;
     if (moe_auto_mode) {
         update_moe_hot_auto();
     }
