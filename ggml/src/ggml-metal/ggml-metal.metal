@@ -2411,6 +2411,56 @@ kernel void kernel_dsv4_hc_weighted_sum(
     *((device float *) (dst + d*args.nb0 + t*args.nb1)) = acc;
 }
 
+
+template<typename KT, typename KT4>
+kernel void kernel_lightning_indexer(
+        constant ggml_metal_kargs_lightning_indexer & args,
+        device  const char * q,
+        device  const char * k,
+        device  const char * w,
+        device  const char * m,
+        device        char * dst,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]]) {
+    const int ik   = (int) tgpig.x;
+    const int t  = (int) tgpig.y;
+    const int s  = (int) tgpig.z;
+    const int lane = (int) tpitg.x;
+
+    device const KT    * k_row = (device const KT    *) (k + ik*args.nbk2 + s*args.nbk3);
+    device const float * w_row = (device const float *) (w + t*args.nbw1  + s*args.nbw3);
+
+    float score = 0.0f;
+    for (int h = 0; h < args.n_head; ++h) {
+        device const float4 * q4 = (device const float4 *) (q + h*args.nbq1 + t*args.nbq2 + s*args.nbq3);
+        device const KT4    * k4 = (device const KT4    *) k_row;
+
+        float qk = 0.0f;
+        for (int i = lane; i < args.n_embd/4; i += 32) {
+            qk += dot(q4[i], float4(k4[i]));
+        }
+        qk = simd_sum(qk);
+
+        if (lane == 0) {
+            score += max(qk, 0.0f) * w_row[h];
+        }
+    }
+
+    if (lane == 0) {
+        device const char * m_row = m + t*args.nbm1 + (s % args.nem3)*args.nbm3;
+        const float mv = args.mask_f16
+            ? (float) ((device const half  *) m_row)[ik]
+            :         ((device const float *) m_row)[ik];
+
+        ((device float *) (dst + t*args.nb1 + s*args.nb3))[ik] = score + mv;
+    }
+}
+
+typedef decltype(kernel_lightning_indexer<float, float4>) kernel_lightning_indexer_t;
+
+template [[host_name("kernel_lightning_indexer_f32")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<float, float4>;
+template [[host_name("kernel_lightning_indexer_f16")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<half,  half4>;
+
 kernel void kernel_ssm_conv_f32_f32(
         constant ggml_metal_kargs_ssm_conv & args,
         device const  void * src0,

@@ -2087,6 +2087,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_expand(params, tensor);
             } break;
+        case GGML_OP_LIGHTNING_INDEXER:
+            {
+                ggml_compute_forward_lightning_indexer(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2273,6 +2277,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
         case GGML_OP_DSV4_HC_WEIGHTED_SUM:
         case GGML_OP_DSV4_HC_EXPAND:
+        case GGML_OP_LIGHTNING_INDEXER:
             {
                 n_tasks = n_threads;
             } break;
@@ -2989,6 +2994,13 @@ struct ggml_cplan ggml_graph_plan(
                             cur  = sizeof(float)*mxDn*n_tasks; // TODO: this can become (n_tasks-1)
                             cur += sizeof(float)*mxDn*n_tasks; // this is overestimated by x2
                         }
+                    } break;
+
+                case GGML_OP_LIGHTNING_INDEXER:
+                    {
+                        // Per-thread buffer for dequantizing lightning indexer keys.
+                        const int64_t ne10 = node->src[1]->ne[0];
+                        cur = sizeof(float) * (ne10 + CACHE_LINE_SIZE_F32) * n_tasks;
                     } break;
 
                 case GGML_OP_CROSS_ENTROPY_LOSS:

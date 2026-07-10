@@ -706,6 +706,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
         indexer_score = ggml_add(ctx0, indexer_score, inp_lid.kq_mask);
         cb(indexer_score, "lid_score_masked", il);
     }
+    ggml_tensor * indexer_score = ggml_lightning_indexer(
+            ctx0, indexer_q, indexer_k, indexer_weights, inp_lid.kq_mask);
+    cb(indexer_score, "lid_score_masked", il);
 
     const uint32_t n_top_k = indexer_score->ne[0] < hparams.indexer_top_k ? indexer_score->ne[0] : hparams.indexer_top_k;
     ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));

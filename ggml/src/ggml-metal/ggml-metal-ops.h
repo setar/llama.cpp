@@ -60,6 +60,7 @@ int ggml_metal_op_soft_max          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_dsv4_hc_split_sinkhorn(ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_dsv4_hc_weighted_sum(ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_dsv4_hc_expand    (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_lightning_indexer (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ssm_conv          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ssm_scan          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_rwkv              (ggml_metal_op_t ctx, int idx);
