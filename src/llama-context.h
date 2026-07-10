@@ -339,6 +339,11 @@ private:
     int64_t moe_token_counter = 0;
     int32_t moe_reclassify_count = 0;
 
+    // mlock accounting for the last reclassify pass
+    mutable size_t  moe_mlock_ok_bytes   = 0;
+    mutable size_t  moe_mlock_fail_bytes = 0;
+    mutable int32_t moe_mlock_fail_errno = 0;
+
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
     std::map<llama_seq_id, std::vector<float>> embd_seq;

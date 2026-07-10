@@ -30,11 +30,39 @@
 #if defined(_WIN32)
 static int llama_moe_mlock(void *, size_t) { return 0; }
 static int llama_moe_munlock(void *, size_t) { return 0; }
+static bool llama_moe_ptr_is_host_mapped(const void *, size_t) { return false; }
 #else
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <unistd.h>
 static int llama_moe_mlock(void * addr, size_t size) { return mlock(addr, size); }
 static int llama_moe_munlock(void * addr, size_t size) { return munlock(addr, size); }
+
+// backends with unified memory (e.g. Metal) report is_host = false although the
+// buffer lives in plain host virtual memory where mlock/munlock apply; probe the
+// address space directly instead of trusting the buffer type
+static bool llama_moe_ptr_is_host_mapped(const void * addr, size_t size) {
+    if (addr == nullptr || size == 0) {
+        return false;
+    }
+
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        return false;
+    }
+
+    const auto probe = [page_size](const void * p) {
+#if defined(__APPLE__)
+        char vec[1];
+#else
+        unsigned char vec[1];
+#endif
+        const uintptr_t base = (uintptr_t) p & ~((uintptr_t) page_size - 1);
+        return mincore((void *) base, 1, vec) == 0;
+    };
+
+    return probe(addr) && probe((const uint8_t *) addr + size - 1);
+}
 #endif
 
 //
@@ -522,7 +550,8 @@ static bool llama_moe_expert_tensor_has_experts(const ggml_tensor * t, uint32_t 
 
 static bool llama_moe_expert_tensor_is_host_backed(const ggml_tensor * t, uint32_t n_expert) {
     return llama_moe_expert_tensor_has_experts(t, n_expert) &&
-        t->data != nullptr && t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer);
+        t->data != nullptr && t->buffer != nullptr &&
+        (ggml_backend_buffer_is_host(t->buffer) || llama_moe_ptr_is_host_mapped(t->data, ggml_nbytes(t)));
 }
 
 void llama_context::init_moe_hot(const llama_context_params & params) {
@@ -601,7 +630,9 @@ void llama_context::init_moe_hot(const llama_context_params & params) {
 
     const int32_t hot_min = *std::min_element(moe_hot_per_layer.begin(), moe_hot_per_layer.end());
     const int32_t hot_max = *std::max_element(moe_hot_per_layer.begin(), moe_hot_per_layer.end());
-    LLAMA_LOG_INFO("%s: MoE hot experts enabled, per-layer hot count range [%d, %d], host-backed expert tensors %d/%d\n",
+    // WARN level: at the default server verbosity llama INFO messages are hidden,
+    // but operators need to see whether the residency subsystem is active
+    LLAMA_LOG_WARN("%s: MoE hot experts enabled, per-layer hot count range [%d, %d], host-backed expert tensors %d/%d\n",
             __func__, hot_min, hot_max, n_host_expert_tensors, n_expert_tensors);
     if (n_host_expert_tensors < n_expert_tensors) {
         LLAMA_LOG_WARN("%s: MoE hot residency applies only to host-backed expert tensors; offloaded experts are not dynamically paged\n",
@@ -620,7 +651,12 @@ void llama_context::touch_moe_expert_tensor(ggml_tensor * t, const std::vector<u
         const uint32_t expert = sorted[rank];
         void * addr = (uint8_t *) t->data + (size_t) expert * expert_size;
         if ((int32_t) rank < hot_count) {
-            llama_moe_mlock(addr, expert_size);
+            if (llama_moe_mlock(addr, expert_size) == 0) {
+                moe_mlock_ok_bytes += expert_size;
+            } else {
+                moe_mlock_fail_bytes += expert_size;
+                moe_mlock_fail_errno = errno;
+            }
         } else {
             llama_moe_munlock(addr, expert_size);
         }
@@ -632,6 +668,10 @@ void llama_context::reclassify_moe_experts() {
     if (moe_hot_count <= 0 || expert_counts.empty() || hparams.n_expert <= 0) {
         return;
     }
+
+    moe_mlock_ok_bytes   = 0;
+    moe_mlock_fail_bytes = 0;
+    moe_mlock_fail_errno = 0;
 
     for (size_t il = 0; il < expert_counts.size() && il < model.layers.size(); ++il) {
         std::vector<uint32_t> sorted(hparams.n_expert);
@@ -648,6 +688,18 @@ void llama_context::reclassify_moe_experts() {
         touch_moe_expert_tensor(layer.ffn_up_exps,      sorted, hot);
         touch_moe_expert_tensor(layer.ffn_down_exps,    sorted, hot);
         touch_moe_expert_tensor(layer.ffn_gate_up_exps, sorted, hot);
+    }
+
+    // WARN so the summary is visible at the default server log verbosity
+    if (moe_mlock_fail_bytes > 0) {
+        LLAMA_LOG_WARN("%s: MoE hot residency: mlock ok = %.1f MiB, FAILED = %.1f MiB (errno = %d '%s') — hot experts are not fully resident\n",
+                __func__,
+                moe_mlock_ok_bytes   / (1024.0 * 1024.0),
+                moe_mlock_fail_bytes / (1024.0 * 1024.0),
+                moe_mlock_fail_errno, strerror(moe_mlock_fail_errno));
+    } else {
+        LLAMA_LOG_WARN("%s: MoE hot residency: mlock ok = %.1f MiB\n",
+                __func__, moe_mlock_ok_bytes / (1024.0 * 1024.0));
     }
 }
 
