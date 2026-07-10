@@ -381,6 +381,10 @@ extern "C" {
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
+        int32_t  moe_hot_count;            // MoE experts to keep locked in RAM, -1 = auto from stats
+        const int32_t * moe_hot_per_layer; // optional per-layer hot expert counts
+        size_t   n_moe_hot_per_layer;
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution

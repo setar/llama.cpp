@@ -889,8 +889,10 @@ public:
     llm_graph_input_i * add_input(llm_graph_input_ptr input);
 
     void add_fused_node(llm_graph_fused_node result);
+    void add_moe_topk(int il, ggml_tensor * tensor);
 
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
+    const std::vector<std::pair<int, ggml_tensor *>> & get_moe_topk() const { return t_moe_topk; }
 
     void set_params(const llm_graph_params & params);
 
@@ -911,6 +913,7 @@ public:
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
+    std::vector<std::pair<int, ggml_tensor *>> t_moe_topk;
 
     ggml_context_ptr ctx_compute;
 

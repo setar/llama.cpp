@@ -1307,6 +1307,7 @@ void llm_graph_result::reset() {
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
+    t_moe_topk.clear();
 
     params = {};
 
@@ -1374,6 +1375,12 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             ggml_set_output(tensor);
         }
     }
+    for (auto & [il, t] : t_moe_topk) {
+        GGML_UNUSED(il);
+        if (t != nullptr) {
+            ggml_set_output(t);
+        }
+    }
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
@@ -1415,6 +1422,10 @@ llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
 
 void llm_graph_result::add_fused_node(llm_graph_fused_node result) {
     fused_nodes.push_back(result);
+}
+
+void llm_graph_result::add_moe_topk(int il, ggml_tensor * tensor) {
+    t_moe_topk.emplace_back(il, tensor);
 }
 
 void llm_graph_result::set_params(const llm_graph_params & params) {
@@ -1471,6 +1482,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     }
 
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
+    if (cparams.moe_hot_count != 0 && strcmp(name, "ffn_moe_topk") == 0) {
+        res->add_moe_topk(il, cur);
+    }
     if (cb_func) {
         cb_func(ubatch, cur, name, il);
     }

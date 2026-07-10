@@ -13,12 +13,29 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
+#include <cerrno>
+#include <cctype>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
+
+#if defined(_WIN32)
+static int llama_moe_mlock(void *, size_t) { return 0; }
+static int llama_moe_munlock(void *, size_t) { return 0; }
+#else
+#include <sys/mman.h>
+#include <sys/stat.h>
+static int llama_moe_mlock(void * addr, size_t size) { return mlock(addr, size); }
+static int llama_moe_munlock(void * addr, size_t size) { return munlock(addr, size); }
+#endif
 
 //
 // llama_context
@@ -138,6 +155,7 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    cparams.moe_hot_count     = params.moe_hot_count;
 
     cparams.ctx_other = nullptr;
 
@@ -159,6 +177,9 @@ llama_context::llama_context(
             cparams.ctx_other = params.ctx_other;
         }
     }
+
+    init_moe_hot(params);
+
 
     auto rope_scaling_type = params.rope_scaling_type;
     if (rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
@@ -478,9 +499,255 @@ llama_context::llama_context(
     }
 }
 
+static std::string llama_moe_expert_stats_path(const llama_model & model) {
+    const char * home = getenv("HOME");
+    std::string dir = home ? std::string(home) + "/.llama" : ".";
+#if !defined(_WIN32)
+    mkdir(dir.c_str(), 0755);
+#endif
+
+    std::string safe = model.name.empty() ? model.arch_name() : model.name;
+    for (char & c : safe) {
+        if (!(std::isalnum((unsigned char) c) || c == '.' || c == '-' || c == '_')) {
+            c = '_';
+        }
+    }
+
+    return dir + "/expert_" + safe + ".bin";
+}
+
+void llama_context::init_moe_hot(const llama_context_params & params) {
+    const auto & hparams = model.hparams;
+    if (hparams.n_expert <= 0 || hparams.n_layer() == 0) {
+        return;
+    }
+
+    moe_auto_mode = params.moe_hot_count == -1;
+    if (moe_auto_mode) {
+        moe_hot_count = std::min<int32_t>(64, hparams.n_expert);
+    } else if (params.moe_hot_count > 0) {
+        moe_hot_count = std::min<int32_t>(params.moe_hot_count, hparams.n_expert);
+    }
+
+    if (moe_hot_count <= 0) {
+        return;
+    }
+
+    moe_hot_per_layer.assign(hparams.n_layer(), moe_hot_count);
+    if (params.moe_hot_per_layer != nullptr && params.n_moe_hot_per_layer > 0) {
+        const size_t n = std::min<size_t>(params.n_moe_hot_per_layer, moe_hot_per_layer.size());
+        for (size_t il = 0; il < n; ++il) {
+            moe_hot_per_layer[il] = std::max<int32_t>(0, std::min<int32_t>(params.moe_hot_per_layer[il], hparams.n_expert));
+        }
+        moe_hot_count = *std::max_element(moe_hot_per_layer.begin(), moe_hot_per_layer.end());
+    }
+
+    expert_counts.assign(hparams.n_layer(), std::vector<uint64_t>(hparams.n_expert, 0));
+    load_expert_stats_default();
+    reclassify_moe_experts();
+
+    const int32_t hot_min = *std::min_element(moe_hot_per_layer.begin(), moe_hot_per_layer.end());
+    const int32_t hot_max = *std::max_element(moe_hot_per_layer.begin(), moe_hot_per_layer.end());
+    LLAMA_LOG_INFO("%s: MoE hot experts enabled, per-layer hot count range [%d, %d]\n", __func__, hot_min, hot_max);
+}
+
+void llama_context::touch_moe_expert_tensor(ggml_tensor * t, const std::vector<uint32_t> & sorted, int32_t hot_count) const {
+    const auto & hparams = model.hparams;
+    if (t == nullptr || t->data == nullptr || hparams.n_expert <= 0 || t->ne[2] != hparams.n_expert) {
+        return;
+    }
+
+    const size_t expert_size = ggml_nbytes(t) / hparams.n_expert;
+    for (uint32_t rank = 0; rank < sorted.size(); ++rank) {
+        const uint32_t expert = sorted[rank];
+        void * addr = (uint8_t *) t->data + (size_t) expert * expert_size;
+        if ((int32_t) rank < hot_count) {
+            llama_moe_mlock(addr, expert_size);
+        } else {
+            llama_moe_munlock(addr, expert_size);
+        }
+    }
+}
+
+void llama_context::reclassify_moe_experts() {
+    const auto & hparams = model.hparams;
+    if (moe_hot_count <= 0 || expert_counts.empty() || hparams.n_expert <= 0) {
+        return;
+    }
+
+    for (size_t il = 0; il < expert_counts.size() && il < model.layers.size(); ++il) {
+        std::vector<uint32_t> sorted(hparams.n_expert);
+        for (uint32_t ie = 0; ie < hparams.n_expert; ++ie) {
+            sorted[ie] = ie;
+        }
+        std::sort(sorted.begin(), sorted.end(), [&](uint32_t a, uint32_t b) {
+            return expert_counts[il][a] > expert_counts[il][b];
+        });
+
+        const int32_t hot = il < moe_hot_per_layer.size() ? moe_hot_per_layer[il] : moe_hot_count;
+        const auto & layer = model.layers[il];
+        touch_moe_expert_tensor(layer.ffn_gate_exps,    sorted, hot);
+        touch_moe_expert_tensor(layer.ffn_up_exps,      sorted, hot);
+        touch_moe_expert_tensor(layer.ffn_down_exps,    sorted, hot);
+        touch_moe_expert_tensor(layer.ffn_gate_up_exps, sorted, hot);
+    }
+}
+
+void llama_context::collect_moe_stats(const llm_graph_result * res, const llama_ubatch & ubatch) {
+    if (moe_hot_count <= 0 || expert_counts.empty()) {
+        return;
+    }
+
+    for (const auto & [il, tensor] : res->get_moe_topk()) {
+        if (tensor == nullptr || il < 0 || (size_t) il >= expert_counts.size()) {
+            continue;
+        }
+        GGML_ASSERT(tensor->type == GGML_TYPE_I32);
+        const size_t n = ggml_nelements(tensor);
+        std::vector<int32_t> selected(n);
+        ggml_backend_tensor_get(tensor, selected.data(), 0, n * sizeof(int32_t));
+
+        for (int32_t expert : selected) {
+            if (expert >= 0 && expert < (int32_t) expert_counts[il].size()) {
+                expert_counts[il][expert]++;
+            }
+        }
+    }
+
+    moe_token_counter += ubatch.n_tokens;
+    constexpr int64_t MOE_RECLASSIFY_INTERVAL = 256;
+    if (moe_token_counter < MOE_RECLASSIFY_INTERVAL) {
+        return;
+    }
+
+    moe_token_counter = 0;
+    if (moe_auto_mode) {
+        update_moe_hot_auto();
+    }
+    reclassify_moe_experts();
+
+    constexpr int32_t MOE_SAVE_INTERVAL = 10;
+    if (++moe_reclassify_count >= MOE_SAVE_INTERVAL) {
+        moe_reclassify_count = 0;
+        save_expert_stats_default();
+    }
+}
+
+void llama_context::save_expert_stats_default() const {
+    save_expert_stats(llama_moe_expert_stats_path(model).c_str());
+}
+
+void llama_context::load_expert_stats_default() {
+    load_expert_stats(llama_moe_expert_stats_path(model).c_str());
+    if (moe_auto_mode) {
+        update_moe_hot_auto();
+    }
+}
+
+void llama_context::save_expert_stats(const char * path) const {
+    if (expert_counts.empty()) {
+        return;
+    }
+
+    FILE * f = fopen(path, "wb");
+    if (f == nullptr) {
+        LLAMA_LOG_WARN("%s: failed to open %s: %s\n", __func__, path, strerror(errno));
+        return;
+    }
+
+    const uint32_t magic = 0x31545345; // EST1
+    const uint32_t n_layer = (uint32_t) expert_counts.size();
+    const uint32_t n_expert = (uint32_t) model.hparams.n_expert;
+    fwrite(&magic, sizeof(magic), 1, f);
+    fwrite(&n_layer, sizeof(n_layer), 1, f);
+    fwrite(&n_expert, sizeof(n_expert), 1, f);
+    for (const auto & layer_counts : expert_counts) {
+        fwrite(layer_counts.data(), sizeof(uint64_t), layer_counts.size(), f);
+    }
+    fclose(f);
+}
+
+bool llama_context::load_expert_stats(const char * path) {
+    if (expert_counts.empty()) {
+        return false;
+    }
+
+    FILE * f = fopen(path, "rb");
+    if (f == nullptr) {
+        return false;
+    }
+
+    uint32_t magic = 0;
+    uint32_t n_layer = 0;
+    uint32_t n_expert = 0;
+    const bool ok_header =
+        fread(&magic, sizeof(magic), 1, f) == 1 &&
+        fread(&n_layer, sizeof(n_layer), 1, f) == 1 &&
+        fread(&n_expert, sizeof(n_expert), 1, f) == 1;
+    if (!ok_header || magic != 0x31545345 ||
+        n_layer != expert_counts.size() || n_expert != (uint32_t) model.hparams.n_expert) {
+        fclose(f);
+        return false;
+    }
+
+    for (auto & layer_counts : expert_counts) {
+        if (fread(layer_counts.data(), sizeof(uint64_t), layer_counts.size(), f) != layer_counts.size()) {
+            fclose(f);
+            return false;
+        }
+    }
+
+    fclose(f);
+    LLAMA_LOG_INFO("%s: loaded MoE expert activation stats from %s\n", __func__, path);
+    return true;
+}
+
+void llama_context::update_moe_hot_auto() {
+    const auto & hparams = model.hparams;
+    if (!moe_auto_mode || expert_counts.empty() || hparams.n_expert <= 0) {
+        return;
+    }
+
+    constexpr double COVERAGE = 0.99;
+    constexpr int32_t HOT_MIN = 4;
+    constexpr int32_t HOT_MAX = 128;
+
+    for (size_t il = 0; il < expert_counts.size(); ++il) {
+        uint64_t total = 0;
+        for (uint64_t c : expert_counts[il]) {
+            total += c;
+        }
+        if (total == 0) {
+            continue;
+        }
+
+        std::vector<uint64_t> counts = expert_counts[il];
+        std::sort(counts.begin(), counts.end(), std::greater<uint64_t>());
+        uint64_t acc = 0;
+        int32_t needed = 0;
+        for (uint64_t c : counts) {
+            acc += c;
+            needed++;
+            if ((double) acc / (double) total >= COVERAGE) {
+                break;
+            }
+        }
+
+        needed = std::max(HOT_MIN, std::min<int32_t>(needed, hparams.n_expert));
+        needed = std::min(needed, HOT_MAX);
+        moe_hot_per_layer[il] = needed;
+    }
+
+    moe_hot_count = *std::max_element(moe_hot_per_layer.begin(), moe_hot_per_layer.end());
+}
+
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    if (moe_hot_count > 0) {
+        save_expert_stats_default();
+    }
 
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -1388,6 +1655,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = status;
         return nullptr;
     }
+    collect_moe_stats(res, ubatch);
 
     ret = GGML_STATUS_SUCCESS;
 
@@ -3522,6 +3790,9 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.moe_hot_count               =*/ 0,
+        /*.moe_hot_per_layer           =*/ nullptr,
+        /*.n_moe_hot_per_layer         =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

@@ -34,6 +34,7 @@
 #include <list>
 #include <regex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread> // for hardware_concurrency
 #include <vector>
@@ -2585,6 +2586,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.load_mode = LLAMA_LOAD_MODE_MLOCK;
         }
     ).set_env("LLAMA_ARG_MLOCK"));
+    add_opt(common_arg(
+        {"--moe-hot-count"}, "N|auto|L0,L1,...",
+        "keep only the hottest MoE experts locked in RAM; use auto to derive per-layer counts from saved expert stats",
+        [](common_params & params, const std::string & value) {
+            params.moe_hot_per_layer.clear();
+            if (value == "auto") {
+                params.moe_hot_count = -1;
+                return;
+            }
+
+            if (value.find(',') == std::string::npos) {
+                params.moe_hot_count = std::stoi(value);
+                return;
+            }
+
+            std::stringstream ss(value);
+            std::string item;
+            int32_t hot_max = 0;
+            while (std::getline(ss, item, ',')) {
+                const int32_t hot = std::stoi(item);
+                params.moe_hot_per_layer.push_back(hot);
+                hot_max = std::max(hot_max, hot);
+            }
+            params.moe_hot_count = hot_max;
+        }
+    ).set_env("LLAMA_ARG_MOE_HOT_COUNT"));
     add_opt(common_arg(
         {"--mmap"},
         {"--no-mmap"},
