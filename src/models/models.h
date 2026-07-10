@@ -1282,6 +1282,7 @@ struct llama_model_deepseek4 : public llama_model_base {
         ggml_tensor * build_hc_sinkhorn(
                 ggml_tensor * comb,
                 int il) const;
+                ggml_tensor * weights) const;
     };
 
     struct graph_mtp : public graph {

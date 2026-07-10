@@ -1083,6 +1083,9 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "DSV4_HC_SPLIT_SINKHORN",
+    "DSV4_HC_WEIGHTED_SUM",
+    "DSV4_HC_EXPAND",
 
     "UNARY",
 
@@ -1101,6 +1104,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 };
 
 static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1198,6 +1202,9 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "dsv4_hc_split_sinkhorn(x)",
+    "dsv4_hc_weighted_sum(x)",
+    "dsv4_hc_expand(x)",
 
     "unary(x)",
 
@@ -1216,6 +1223,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 };
 
 static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6347,6 +6355,9 @@ struct ggml_tensor * ggml_lightning_indexer(
 // ggml_dsv4_hc_comb
 
 struct ggml_tensor * ggml_dsv4_hc_comb(
+// ggml_dsv4_hc_split_sinkhorn
+
+struct ggml_tensor * ggml_dsv4_hc_split_sinkhorn(
         struct ggml_context * ctx,
         struct ggml_tensor  * mixes,
         struct ggml_tensor  * scale,
@@ -6388,6 +6399,32 @@ struct ggml_tensor * ggml_dsv4_hc_comb(
     ggml_set_op_params_i32(result, 1, n_iter);
 
     result->op     = GGML_OP_DSV4_HC_COMB;
+        int                   n_hc,
+        int                   sinkhorn_iters,
+        float                 eps) {
+    GGML_ASSERT(mixes->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->type  == GGML_TYPE_F32);
+
+    GGML_ASSERT(ggml_is_contiguous_rows(mixes));
+    GGML_ASSERT(ggml_is_contiguous(scale));
+    GGML_ASSERT(ggml_is_contiguous(base));
+
+    GGML_ASSERT(n_hc > 0);
+    GGML_ASSERT(sinkhorn_iters > 0);
+    GGML_ASSERT(mixes->ne[0] == (2 + n_hc) * n_hc);
+    GGML_ASSERT(mixes->ne[2] == 1);
+    GGML_ASSERT(mixes->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(scale) >= 3);
+    GGML_ASSERT(ggml_nelements(base)  >= mixes->ne[0]);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, mixes);
+
+    ggml_set_op_params_i32(result, 0, n_hc);
+    ggml_set_op_params_i32(result, 1, sinkhorn_iters);
+    ggml_set_op_params_f32(result, 2, eps);
+
+    result->op     = GGML_OP_DSV4_HC_SPLIT_SINKHORN;
     result->src[0] = mixes;
     result->src[1] = scale;
     result->src[2] = base;
@@ -6418,6 +6455,24 @@ struct ggml_tensor * ggml_dsv4_hc_pre(
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
 
     result->op     = GGML_OP_DSV4_HC_PRE;
+// ggml_dsv4_hc_weighted_sum
+
+struct ggml_tensor * ggml_dsv4_hc_weighted_sum(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * weights) {
+    GGML_ASSERT(x->type       == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(x->ne[1] == weights->ne[0]);
+    GGML_ASSERT(x->ne[2] == weights->ne[1]);
+    GGML_ASSERT(x->ne[3] == 1);
+    GGML_ASSERT(weights->ne[2] == 1);
+    GGML_ASSERT(weights->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[2]);
+
+    result->op     = GGML_OP_DSV4_HC_WEIGHTED_SUM;
     result->src[0] = x;
     result->src[1] = weights;
 
@@ -6463,6 +6518,36 @@ struct ggml_tensor * ggml_dsv4_hc_post(
 
     result->op     = GGML_OP_DSV4_HC_POST;
     result->src[0] = x;
+// ggml_dsv4_hc_expand
+
+struct ggml_tensor * ggml_dsv4_hc_expand(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * block_out,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * post,
+        struct ggml_tensor  * comb) {
+    GGML_ASSERT(block_out->type == GGML_TYPE_F32);
+    GGML_ASSERT(residual->type  == GGML_TYPE_F32);
+    GGML_ASSERT(post->type      == GGML_TYPE_F32);
+    GGML_ASSERT(comb->type      == GGML_TYPE_F32);
+
+    GGML_ASSERT(block_out->ne[0] == residual->ne[0]);
+    GGML_ASSERT(block_out->ne[1] == residual->ne[2]);
+    GGML_ASSERT(block_out->ne[2] == 1);
+    GGML_ASSERT(block_out->ne[3] == 1);
+    GGML_ASSERT(post->ne[0] == residual->ne[1]);
+    GGML_ASSERT(post->ne[1] == residual->ne[2]);
+    GGML_ASSERT(post->ne[2] == 1);
+    GGML_ASSERT(post->ne[3] == 1);
+    GGML_ASSERT(comb->ne[0] == residual->ne[1]);
+    GGML_ASSERT(comb->ne[1] == residual->ne[1]);
+    GGML_ASSERT(comb->ne[2] == residual->ne[2]);
+    GGML_ASSERT(comb->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, residual);
+
+    result->op     = GGML_OP_DSV4_HC_EXPAND;
+    result->src[0] = block_out;
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;

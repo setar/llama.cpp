@@ -574,6 +574,9 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DSV4_HC_SPLIT_SINKHORN,
+        GGML_OP_DSV4_HC_WEIGHTED_SUM,
+        GGML_OP_DSV4_HC_EXPAND,
 
         GGML_OP_UNARY,
 
@@ -2636,6 +2639,34 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_dsv4_hc_post(
             struct ggml_context * ctx,
             struct ggml_tensor  * x,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * post,
+            struct ggml_tensor  * comb);
+
+    // DeepSeek V4 hyperconnection helper.
+    // Splits [mix, tokens] into pre/post/comb regions and applies the
+    // Sinkhorn normalization used by the reference implementation.
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_split_sinkhorn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mixes,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            int                   n_hc,
+            int                   sinkhorn_iters,
+            float                 eps);
+
+    // DeepSeek V4 hyperconnection weighted-sum helper.
+    // Computes sum_hc weights[hc, token] * x[embd, hc, token].
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_weighted_sum(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * weights);
+
+    // DeepSeek V4 hyperconnection expand helper.
+    // Computes post * block_out + comb^T @ residual for each token.
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_expand(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * block_out,
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);

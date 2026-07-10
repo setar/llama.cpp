@@ -344,6 +344,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_sinkhorn(
     }
 
     return comb;
+        ggml_tensor * weights) const {
+    return ggml_dsv4_hc_weighted_sum(ctx0, x, weights);
 }
 
 ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
@@ -377,12 +379,21 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
     pre = dsv4_hc_affine(ctx0, pre, scale_pre, base_pre);
     pre = ggml_sigmoid(ctx0, pre);
     pre = ggml_scale_bias(ctx0, pre, 1.0f, hparams.dsv4_hc_eps);
+    // fused: split mixes into pre/post/comb, affine + sigmoid + Sinkhorn in one op
+    ggml_tensor * split = ggml_dsv4_hc_split_sinkhorn(ctx0, mixes, hc_scale, hc_base,
+            hc, hparams.dsv4_hc_sinkhorn_iters, hparams.dsv4_hc_eps);
+
+    ggml_tensor * pre       = ggml_view_2d(ctx0, split, hc,    nt, split->nb[1], 0);
+    ggml_tensor * post_view = ggml_view_2d(ctx0, split, hc,    nt, split->nb[1],   hc*split->nb[0]);
+    ggml_tensor * comb_flat = ggml_view_2d(ctx0, split, hc*hc, nt, split->nb[1], 2*hc*split->nb[0]);
+    if (nt != 1) {
+        pre       = ggml_cont(ctx0, pre);
+        post_view = ggml_cont(ctx0, post_view);
+        comb_flat = ggml_cont(ctx0, comb_flat);
+    }
     cb(pre, "hc_pre", il);
 
-    *post = dsv4_view_2d(ctx0, mixes, hc, nt, hc);
-    *post = dsv4_hc_affine(ctx0, *post, scale_post, base_post);
-    *post = ggml_sigmoid(ctx0, *post);
-    *post = ggml_scale(ctx0, *post, 2.0f);
+    *post = post_view;
     cb(*post, "hc_post", il);
 
     if (cparams.fused_dsv4_hc_comb) {
@@ -398,6 +409,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
         *comb = ggml_reshape_3d(ctx0, *comb, hc, hc, nt);
         *comb = build_hc_sinkhorn(*comb, il);
     }
+    *comb = ggml_reshape_3d(ctx0, comb_flat, hc, hc, nt);
     cb(*comb, "hc_comb", il);
 
     ggml_tensor * result = build_hc_pre(x, pre, il);
@@ -422,10 +434,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_post(
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = x->ne[1];
 
-    ggml_tensor * out = nullptr;
-    for (int64_t dst = 0; dst < hc; ++dst) {
-        ggml_tensor * post_dst = ggml_view_2d(ctx0, post, 1, nt, post->nb[1], dst*post->nb[0]);
-        ggml_tensor * cur = ggml_mul(ctx0, x, post_dst);
+    GGML_ASSERT(residual->ne[1] == hc);
+    GGML_ASSERT(residual->ne[2] == nt);
 
         for (int64_t src = 0; src < hc; ++src) {
             ggml_tensor * res_src = ggml_view_2d(ctx0, residual, n_embd, nt, residual->nb[2], src*residual->nb[1]);
@@ -439,6 +449,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_post(
     }
 
     return out;
+    // fused: out[:, dst, t] = x[:, t] * post[dst, t] + sum_src residual[:, src, t] * comb[dst, src, t]
+    return ggml_dsv4_hc_expand(ctx0, x, residual, post, comb);
 }
 
 ggml_tensor * llama_model_deepseek4::graph::build_hc_head(

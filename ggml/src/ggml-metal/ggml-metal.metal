@@ -2185,6 +2185,232 @@ template [[host_name("kernel_soft_max_f16_4")]] kernel kernel_soft_max_4_t kerne
 template [[host_name("kernel_soft_max_f32_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<float4>;
 
 // ref: ggml.c:ggml_compute_forward_ssm_conv_f32
+kernel void kernel_dsv4_hc_split_sinkhorn(
+        constant ggml_metal_kargs_dsv4_hc_split_sinkhorn & args,
+        device  const float * mixes,
+        device  const float * scale,
+        device  const float * base,
+        device        float * dst,
+        uint tid [[thread_position_in_grid]]) {
+    if ((int64_t) tid >= args.n_rows) {
+        return;
+    }
+
+    constexpr int HC_MAX = 16;
+    const int HC = args.n_hc;
+    if (HC <= 0 || HC > HC_MAX) {
+        return;
+    }
+
+    device const float * mix = mixes + ((int64_t) tid)*args.mix_hc;
+    device       float * out = dst    + ((int64_t) tid)*args.mix_hc;
+
+    const float epsv       = args.eps;
+    const float pre_scale  = scale[0];
+    const float post_scale = scale[1];
+    const float comb_scale = scale[2];
+
+    if (HC == 4) {
+        const float4 pre_z =
+            *((device const float4 *) mix) * pre_scale +
+            *((device const float4 *) base);
+        *((device float4 *) out) = 1.0f / (1.0f + exp(-pre_z)) + epsv;
+
+        const float4 post_z =
+            *((device const float4 *) (mix  + 4)) * post_scale +
+            *((device const float4 *) (base + 4));
+        *((device float4 *) (out + 4)) = 2.0f / (1.0f + exp(-post_z));
+
+        float4 r0 =
+            *((device const float4 *) (mix  +  8)) * comb_scale +
+            *((device const float4 *) (base +  8));
+        float4 r1 =
+            *((device const float4 *) (mix  + 12)) * comb_scale +
+            *((device const float4 *) (base + 12));
+        float4 r2 =
+            *((device const float4 *) (mix  + 16)) * comb_scale +
+            *((device const float4 *) (base + 16));
+        float4 r3 =
+            *((device const float4 *) (mix  + 20)) * comb_scale +
+            *((device const float4 *) (base + 20));
+
+        const float m0 = max(max(r0.x, r0.y), max(r0.z, r0.w));
+        const float m1 = max(max(r1.x, r1.y), max(r1.z, r1.w));
+        const float m2 = max(max(r2.x, r2.y), max(r2.z, r2.w));
+        const float m3 = max(max(r3.x, r3.y), max(r3.z, r3.w));
+
+        r0 = exp(r0 - m0);
+        r1 = exp(r1 - m1);
+        r2 = exp(r2 - m2);
+        r3 = exp(r3 - m3);
+
+        r0 = r0 * (1.0f / (r0.x + r0.y + r0.z + r0.w)) + epsv;
+        r1 = r1 * (1.0f / (r1.x + r1.y + r1.z + r1.w)) + epsv;
+        r2 = r2 * (1.0f / (r2.x + r2.y + r2.z + r2.w)) + epsv;
+        r3 = r3 * (1.0f / (r3.x + r3.y + r3.z + r3.w)) + epsv;
+
+        float4 col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
+        r0 *= col_inv;
+        r1 *= col_inv;
+        r2 *= col_inv;
+        r3 *= col_inv;
+
+        for (int iter = 1; iter < args.sinkhorn_iters; ++iter) {
+            r0 *= 1.0f / (r0.x + r0.y + r0.z + r0.w + epsv);
+            r1 *= 1.0f / (r1.x + r1.y + r1.z + r1.w + epsv);
+            r2 *= 1.0f / (r2.x + r2.y + r2.z + r2.w + epsv);
+            r3 *= 1.0f / (r3.x + r3.y + r3.z + r3.w + epsv);
+
+            col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
+            r0 *= col_inv;
+            r1 *= col_inv;
+            r2 *= col_inv;
+            r3 *= col_inv;
+        }
+
+        *((device float4 *) (out +  8)) = r0;
+        *((device float4 *) (out + 12)) = r1;
+        *((device float4 *) (out + 16)) = r2;
+        *((device float4 *) (out + 20)) = r3;
+        return;
+    }
+
+    for (int i = 0; i < HC; ++i) {
+        const float z = mix[i] * pre_scale + base[i];
+        out[i] = 1.0f / (1.0f + exp(-z)) + epsv;
+    }
+
+    for (int i = 0; i < HC; ++i) {
+        const int off = HC + i;
+        const float z = mix[off] * post_scale + base[off];
+        out[off] = 2.0f / (1.0f + exp(-z));
+    }
+
+    float c[HC_MAX*HC_MAX];
+
+    for (int dst_hc = 0; dst_hc < HC; ++dst_hc) {
+        float row_max = -INFINITY;
+        for (int src_hc = 0; src_hc < HC; ++src_hc) {
+            const int idx = src_hc + dst_hc*HC;
+            const int off = 2*HC + idx;
+            const float v = mix[off] * comb_scale + base[off];
+            c[idx] = v;
+            row_max = max(row_max, v);
+        }
+
+        float row_sum = 0.0f;
+        for (int src_hc = 0; src_hc < HC; ++src_hc) {
+            const int idx = src_hc + dst_hc*HC;
+            const float v = exp(c[idx] - row_max);
+            c[idx] = v;
+            row_sum += v;
+        }
+
+        const float inv_sum = 1.0f / row_sum;
+        for (int src_hc = 0; src_hc < HC; ++src_hc) {
+            const int idx = src_hc + dst_hc*HC;
+            c[idx] = c[idx] * inv_sum + epsv;
+        }
+    }
+
+    for (int src_hc = 0; src_hc < HC; ++src_hc) {
+        float sum = 0.0f;
+        for (int dst_hc = 0; dst_hc < HC; ++dst_hc) {
+            sum += c[src_hc + dst_hc*HC];
+        }
+
+        const float inv_denom = 1.0f / (sum + epsv);
+        for (int dst_hc = 0; dst_hc < HC; ++dst_hc) {
+            c[src_hc + dst_hc*HC] *= inv_denom;
+        }
+    }
+
+    for (int iter = 1; iter < args.sinkhorn_iters; ++iter) {
+        for (int dst_hc = 0; dst_hc < HC; ++dst_hc) {
+            float sum = 0.0f;
+            for (int src_hc = 0; src_hc < HC; ++src_hc) {
+                sum += c[src_hc + dst_hc*HC];
+            }
+
+            const float inv_denom = 1.0f / (sum + epsv);
+            for (int src_hc = 0; src_hc < HC; ++src_hc) {
+                c[src_hc + dst_hc*HC] *= inv_denom;
+            }
+        }
+
+        for (int src_hc = 0; src_hc < HC; ++src_hc) {
+            float sum = 0.0f;
+            for (int dst_hc = 0; dst_hc < HC; ++dst_hc) {
+                sum += c[src_hc + dst_hc*HC];
+            }
+
+            const float inv_denom = 1.0f / (sum + epsv);
+            for (int dst_hc = 0; dst_hc < HC; ++dst_hc) {
+                c[src_hc + dst_hc*HC] *= inv_denom;
+            }
+        }
+    }
+
+    for (int i = 0; i < HC*HC; ++i) {
+        out[2*HC + i] = c[i];
+    }
+}
+
+kernel void kernel_dsv4_hc_expand(
+        constant ggml_metal_kargs_dsv4_hc_expand & args,
+        device  const char * block_out,
+        device  const char * residual,
+        device  const char * post,
+        device  const char * comb,
+        device        char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const int64_t n_elem = args.n_embd * args.n_hc * args.n_tokens;
+    if ((int64_t) gid >= n_elem) {
+        return;
+    }
+
+    const int64_t d      = ((int64_t) gid) % args.n_embd;
+    const int64_t tmp    = ((int64_t) gid) / args.n_embd;
+    const int64_t dst_hc = tmp % args.n_hc;
+    const int64_t t      = tmp / args.n_hc;
+
+    const float block_v = *((device const float *) (block_out + d*args.nb_block0 + t*args.nb_block1));
+    const float post_v  = *((device const float *) (post      + dst_hc*args.nb_post0 + t*args.nb_post1));
+
+    float acc = block_v * post_v;
+    for (int64_t src_hc = 0; src_hc < args.n_hc; ++src_hc) {
+        const float comb_v = *((device const float *) (comb     + dst_hc*args.nb_comb0 + src_hc*args.nb_comb1 + t*args.nb_comb2));
+        const float res_v  = *((device const float *) (residual + d*args.nb_res0 + src_hc*args.nb_res1 + t*args.nb_res2));
+        acc += comb_v * res_v;
+    }
+
+    *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1 + t*args.nb2)) = acc;
+}
+
+kernel void kernel_dsv4_hc_weighted_sum(
+        constant ggml_metal_kargs_dsv4_hc_weighted_sum & args,
+        device  const char * x,
+        device  const char * weights,
+        device        char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const int64_t n_elem = args.n_embd * args.n_tokens;
+    if ((int64_t) gid >= n_elem) {
+        return;
+    }
+
+    const int64_t d = ((int64_t) gid) % args.n_embd;
+    const int64_t t = ((int64_t) gid) / args.n_embd;
+
+    float acc = 0.0f;
+    for (int64_t h = 0; h < args.n_hc; ++h) {
+        const float xv = *((device const float *) (x       + d*args.nb_x0 + h*args.nb_x1 + t*args.nb_x2));
+        const float wv = *((device const float *) (weights + h*args.nb_w0 + t*args.nb_w1));
+        acc += xv * wv;
+    }
+
+    *((device float *) (dst + d*args.nb0 + t*args.nb1)) = acc;
+}
+
 kernel void kernel_ssm_conv_f32_f32(
         constant ggml_metal_kargs_ssm_conv & args,
         device const  void * src0,
