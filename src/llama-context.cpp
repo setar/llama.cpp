@@ -735,7 +735,9 @@ void llama_context::collect_moe_stats(const llm_graph_result * res, const llama_
     // buys nothing: prefill activates nearly all experts regardless. Skip
     // entirely for prompt batches — the counter keeps accumulating and the
     // first decode token consumes the whole prompt remainder as one update.
-    constexpr int64_t MOE_RECLASSIFY_INTERVAL_DECODE = 256;
+    // 256 caused an mlock churn over the ~88 GiB hot set every ~10 s of decode;
+    // expert usage statistics drift far slower than that
+    constexpr int64_t MOE_RECLASSIFY_INTERVAL_DECODE = 1024;
     if (ubatch.n_tokens > 1 || moe_token_counter < MOE_RECLASSIFY_INTERVAL_DECODE) {
         return;
     }
