@@ -6381,6 +6381,135 @@ kernel void kernel_timestep_embedding_f32(
 }
 
 // bitonic sort implementation following the CUDA kernels as reference
+// radix-select top-k для больших строк: гистограммы по байтам ключа (MSB->LSB)
+// сужают кандидатов за 4 раунда без полной сортировки; вывод неупорядочен.
+// scratch на строку: hist[256] + state[4] {prefix, k_rem, c_gt, c_tie}
+
+static inline uint top_k_radix_key(float f) {
+    uint u = as_type<uint>(f);
+    return u ^ ((u & 0x80000000u) ? 0xFFFFFFFFu : 0x80000000u);
+}
+
+#define TOP_K_RADIX_STATE_STRIDE 260  // uint на строку: 256 hist + 4 state
+
+kernel void kernel_top_k_radix_init(
+        constant ggml_metal_kargs_top_k_radix & args,
+        device       uint * scratch,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3  tpitg3 [[thread_position_in_threadgroup]]) {
+    const ushort tpitg = (ushort) tpitg3.x;
+    const int row = (int) tgpig.y + args.ne01*(int) tgpig.z;
+    device uint * st = scratch + row*TOP_K_RADIX_STATE_STRIDE;
+    st[tpitg] = 0;
+    if (tpitg == 0) {
+        st[256] = 0;              // prefix
+        st[257] = (uint) args.k;  // k_rem
+        st[258] = 0;              // c_gt
+        st[259] = 0;              // c_tie
+    }
+}
+
+kernel void kernel_top_k_radix_hist(
+        constant ggml_metal_kargs_top_k_radix & args,
+        device  const char * src0,
+        device       atomic_uint * scratch,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3  tpitg3 [[thread_position_in_threadgroup]]) {
+    const ushort tpitg = (ushort) tpitg3.x;
+    const int i1 = (int) tgpig.y;
+    const int i2 = (int) tgpig.z % args.ne02;
+    const int i3 = (int) tgpig.z / args.ne02;
+    const int row = i1 + args.ne01*(int) tgpig.z;
+
+    device const float * x = (device const float *) (src0 + i1*args.nb01 + i2*args.nb02 + i3*args.nb03);
+    device atomic_uint * hist = scratch + row*TOP_K_RADIX_STATE_STRIDE;
+    device const uint  * st   = (device const uint *) hist;
+
+    threadgroup atomic_uint lhist[256];
+    atomic_store_explicit(&lhist[tpitg], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint prefix = st[256];
+    const int  r      = args.round;
+
+    for (int i = (int) tgpig.x*256 + tpitg; i < args.ne00; i += args.nblocks*256) {
+        const uint u = top_k_radix_key(x[i]);
+        if (r == 3 || (u >> ((r + 1)*8)) == prefix) {
+            const uint b = (u >> (r*8)) & 0xFF;
+            atomic_fetch_add_explicit(&lhist[b], 1u, memory_order_relaxed);
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint c = atomic_load_explicit(&lhist[tpitg], memory_order_relaxed);
+    if (c > 0) {
+        atomic_fetch_add_explicit(&hist[tpitg], c, memory_order_relaxed);
+    }
+}
+
+kernel void kernel_top_k_radix_scan(
+        constant ggml_metal_kargs_top_k_radix & args,
+        device       uint * scratch,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3  tpitg3 [[thread_position_in_threadgroup]]) {
+    const ushort tpitg = (ushort) tpitg3.x;
+    const int row = (int) tgpig.y + args.ne01*(int) tgpig.z;
+    device uint * st = scratch + row*TOP_K_RADIX_STATE_STRIDE;
+
+    if (tpitg == 0) {
+        const uint k_rem = st[257];
+        uint cum = 0;
+        int  b   = 255;
+        for (; b > 0; --b) {
+            if (cum + st[b] >= k_rem) {
+                break;
+            }
+            cum += st[b];
+        }
+        st[256] = (st[256] << 8) | (uint) b;
+        st[257] = k_rem - cum;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    st[tpitg] = 0; // обнулить hist под следующий раунд
+}
+
+kernel void kernel_top_k_radix_compact(
+        constant ggml_metal_kargs_top_k_radix & args,
+        device  const char * src0,
+        device       atomic_uint * scratch,
+        device       char * dst,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3  tpitg3 [[thread_position_in_threadgroup]]) {
+    const ushort tpitg = (ushort) tpitg3.x;
+    const int i1 = (int) tgpig.y;
+    const int i2 = (int) tgpig.z % args.ne02;
+    const int i3 = (int) tgpig.z / args.ne02;
+    const int row = i1 + args.ne01*(int) tgpig.z;
+
+    device const float * x  = (device const float *) (src0 + i1*args.nb01 + i2*args.nb02 + i3*args.nb03);
+    device atomic_uint * st = scratch + row*TOP_K_RADIX_STATE_STRIDE;
+    device const uint  * su = (device const uint *) st;
+
+    const uint T     = su[256];             // порог (полный 32-битный ключ)
+    const uint k_rem = su[257];             // сколько ключей == T добрать
+    const uint base  = (uint) args.k - k_rem;
+
+    device int32_t * out = (device int32_t *) dst + (uint64_t) row*args.k;
+
+    for (int i = (int) tgpig.x*256 + tpitg; i < args.ne00; i += args.nblocks*256) {
+        const uint u = top_k_radix_key(x[i]);
+        if (u > T) {
+            const uint slot = atomic_fetch_add_explicit(&st[258], 1u, memory_order_relaxed);
+            out[slot] = i;
+        } else if (u == T) {
+            const uint j = atomic_fetch_add_explicit(&st[259], 1u, memory_order_relaxed);
+            if (j < k_rem) {
+                out[base + j] = i;
+            }
+        }
+    }
+}
+
 typedef void (argsort_t)(
         constant   ggml_metal_kargs_argsort & args,
         device   const char * src0,

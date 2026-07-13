@@ -5513,6 +5513,71 @@ int ggml_metal_op_top_k(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
+    // radix-select для длинных строк: 4 раунда гистограмм вместо полной
+    // сортировки; вывод неупорядочен (контракт top_k порядок не задаёт)
+    if (ne00 >= 16384 && op->src[0]->type == GGML_TYPE_F32) {
+        const int nrows02 = ne02*ne03;
+        const int nblocks = std::min(256, (ne00 + 4095)/4096);
+
+        ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
+        ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
+
+        ggml_metal_buffer_id bid_scr = bid_dst;
+        bid_scr.offs += sizeof(int32_t)*ggml_nelements(op->src[0]);
+
+        ggml_metal_kargs_top_k_radix args = {
+            /*.ne00    =*/ ne00,
+            /*.ne01    =*/ ne01,
+            /*.ne02    =*/ ne02,
+            /*.nb01    =*/ nb01,
+            /*.nb02    =*/ nb02,
+            /*.nb03    =*/ nb03,
+            /*.k       =*/ ne0,
+            /*.round   =*/ 0,
+            /*.nblocks =*/ nblocks,
+        };
+
+        auto pl_init    = ggml_metal_library_get_pipeline_top_k_radix(lib, "init");
+        auto pl_hist    = ggml_metal_library_get_pipeline_top_k_radix(lib, "hist");
+        auto pl_scan    = ggml_metal_library_get_pipeline_top_k_radix(lib, "scan");
+        auto pl_compact = ggml_metal_library_get_pipeline_top_k_radix(lib, "compact");
+
+        ggml_metal_encoder_set_pipeline(enc, pl_init);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, bid_scr, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, 1, ne01, nrows02, 256, 1, 1);
+
+        for (int r = 3; r >= 0; --r) {
+            args.round = r;
+
+            ggml_metal_op_concurrency_reset(ctx);
+
+            ggml_metal_encoder_set_pipeline(enc, pl_hist);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+            ggml_metal_encoder_set_buffer  (enc, bid_scr,  2);
+            ggml_metal_encoder_dispatch_threadgroups(enc, nblocks, ne01, nrows02, 256, 1, 1);
+
+            ggml_metal_op_concurrency_reset(ctx);
+
+            ggml_metal_encoder_set_pipeline(enc, pl_scan);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_scr, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, 1, ne01, nrows02, 256, 1, 1);
+        }
+
+        ggml_metal_op_concurrency_reset(ctx);
+
+        ggml_metal_encoder_set_pipeline(enc, pl_compact);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_scr,  2);
+        ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
+        ggml_metal_encoder_dispatch_threadgroups(enc, nblocks, ne01, nrows02, 256, 1, 1);
+
+        return 1;
+    }
+
     auto pipeline = ggml_metal_library_get_pipeline_top_k(lib, op);
 
     // bitonic sort requires the number of elements to be power of 2
