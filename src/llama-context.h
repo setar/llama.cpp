@@ -266,6 +266,7 @@ private:
     void reclassify_moe_experts();
     void touch_moe_expert_tensor(ggml_tensor * t, const std::vector<uint32_t> & sorted, int32_t hot_count) const;
     void update_moe_hot_auto();
+    void apply_moe_hot_budget();
     void save_expert_stats_default() const;
     void load_expert_stats_default();
     void save_expert_stats(const char * path) const;
@@ -334,6 +335,7 @@ private:
 
     int32_t moe_hot_count = 0;
     bool moe_auto_mode = false;
+    size_t moe_hot_budget_bytes = 0;
     std::vector<int32_t> moe_hot_per_layer;
     std::vector<std::vector<uint64_t>> expert_counts;
     int64_t moe_token_counter = 0;

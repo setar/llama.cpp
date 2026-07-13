@@ -2630,6 +2630,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_HOT_COUNT"));
     add_opt(common_arg(
+        {"--moe-hot-budget-mib"}, "N",
+        "maximum MiB locked for hot MoE experts in auto mode (0 = unlimited)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("MoE hot budget must be non-negative");
+            }
+            params.moe_hot_budget_mib = (size_t) value;
+        }
+    ).set_env("LLAMA_ARG_MOE_HOT_BUDGET_MIB"));
+    add_opt(common_arg(
         {"--mmap"},
         {"--no-mmap"},
         "DEPRECATED in favor of `--load-mode`: whether to memory-map model. (if mmap disabled, slower load but may reduce pageouts if not using mlock)",

@@ -382,6 +382,7 @@ extern "C" {
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
         int32_t  moe_hot_count;            // MoE experts to keep locked in RAM, -1 = auto from stats
+        size_t   moe_hot_budget_mib;       // maximum locked MoE expert memory in auto mode, 0 = unlimited
         const int32_t * moe_hot_per_layer; // optional per-layer hot expert counts
         size_t   n_moe_hot_per_layer;
 

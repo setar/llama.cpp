@@ -1665,6 +1665,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
     cparams.moe_hot_count     = params.moe_hot_count;
+    cparams.moe_hot_budget_mib = params.moe_hot_budget_mib;
     cparams.moe_hot_per_layer = params.moe_hot_per_layer.empty() ? nullptr : params.moe_hot_per_layer.data();
     cparams.n_moe_hot_per_layer = params.moe_hot_per_layer.size();
 
