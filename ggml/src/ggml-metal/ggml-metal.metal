@@ -8990,31 +8990,29 @@ void kernel_mul_mv_q5_K_f32_impl(
         }
 
         for (short row = 0; row < nr0; ++row) {
-            device const uint8_t * q2 = q1 + 64;
-
             sc16[0] = a[0] & kmask1;
             sc16[1] = a[2] & kmask1;
             sc16[2] = ((a[4] >> 0) & kmask2) | ((a[0] & kmask3) >> 2);
             sc16[3] = ((a[4] >> 4) & kmask2) | ((a[2] & kmask3) >> 2);
 
-            float4 acc1 = {0.f};
-            float4 acc2 = {0.f};
+            // словные загрузки вместо побайтовых: qs/qh выровнены на 8 внутри блока
+            const uint2 w1 = *(device const uint2 *)(q1);
+            const uint2 w2 = *(device const uint2 *)(q1 + 64);
+            const uint2 wh = *(device const uint2 *)(qh);
+
+            float4 acc = {0.f};
             FOR_UNROLL (short l = 0; l < 8; ++l) {
-                uint8_t h = qh[l];
-                acc1[0] += yl[l+0] * (q1[l] & 0x0F);
-                acc1[1] += yl[l+8] * (q1[l] & 0xF0);
-                acc1[2] += yh[l+0] * (q2[l] & 0x0F);
-                acc1[3] += yh[l+8] * (q2[l] & 0xF0);
-                acc2[0] += h & hm1 ? yl[l+0] : 0.f;
-                acc2[1] += h & hm2 ? yl[l+8] : 0.f;
-                acc2[2] += h & hm3 ? yh[l+0] : 0.f;
-                acc2[3] += h & hm4 ? yh[l+8] : 0.f;
+                const uint32_t b1 = (l < 4 ? w1.x : w1.y) >> (8*(l & 3));
+                const uint32_t b2 = (l < 4 ? w2.x : w2.y) >> (8*(l & 3));
+                const uint32_t h  = (l < 4 ? wh.x : wh.y) >> (8*(l & 3));
+                // 5-й бит вливается в значение до mad — одна цепочка аккумуляции вместо двух
+                acc[0] += yl[l+0] * (float)(( b1       & 0x0F) + (h & hm1 ? 16 : 0));
+                acc[1] += yl[l+8] * (float)(((b1 >> 4) & 0x0F) + (h & hm2 ? 16 : 0));
+                acc[2] += yh[l+0] * (float)(( b2       & 0x0F) + (h & hm3 ? 16 : 0));
+                acc[3] += yh[l+8] * (float)(((b2 >> 4) & 0x0F) + (h & hm4 ? 16 : 0));
             }
 
-            sumf[row] += dh[0] * (sc8[0] * (acc1[0]      + 16.f*acc2[0]) +
-                                  sc8[1] * (acc1[1]/16.f + 16.f*acc2[1]) +
-                                  sc8[4] * (acc1[2]      + 16.f*acc2[2]) +
-                                  sc8[5] * (acc1[3]/16.f + 16.f*acc2[3])) -
+            sumf[row] += dh[0] * (sc8[0]*acc[0] + sc8[1]*acc[1] + sc8[4]*acc[2] + sc8[5]*acc[3]) -
                          dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
 
             q1 += args.nb01;
