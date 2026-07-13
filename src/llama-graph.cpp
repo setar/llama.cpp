@@ -1378,7 +1378,15 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     for (auto & [il, t] : t_moe_topk) {
         GGML_UNUSED(il);
         if (t != nullptr) {
-            ggml_set_output(t);
+            // the topk tensor is usually a view of the argsort output; the output flag on a
+            // view does not keep the allocator from reusing the argsort buffer after its last
+            // graph consumer, so reading the view after compute would see other layers' data.
+            // read the stats from an owned copy instead. appended here, after the full build,
+            // so the copy node does not break up op sequences targeted by backend fusion.
+            ggml_tensor * cpy = ggml_cont(ctx_compute.get(), t);
+            ggml_build_forward_expand(gf, cpy);
+            ggml_set_output(cpy);
+            t = cpy;
         }
     }
 }
