@@ -726,21 +726,16 @@ void llama_context::collect_moe_stats(const llm_graph_result * res, const llama_
 
     moe_token_counter += ubatch.n_tokens;
     // Reclassifying touches every expert tensor and is disproportionately
-    // expensive during prompt ingestion. Decode keeps the shorter interval;
-    // any prompt remainder triggers a final update on the first decode token.
+    // expensive during prompt ingestion, while a mid-prompt hot set update
+    // buys nothing: prefill activates nearly all experts regardless. Skip
+    // entirely for prompt batches — the counter keeps accumulating and the
+    // first decode token consumes the whole prompt remainder as one update.
     constexpr int64_t MOE_RECLASSIFY_INTERVAL_DECODE = 256;
-    constexpr int64_t MOE_RECLASSIFY_INTERVAL_PROMPT = 8192;
-    const int64_t interval = ubatch.n_tokens > 1
-        ? MOE_RECLASSIFY_INTERVAL_PROMPT
-        : MOE_RECLASSIFY_INTERVAL_DECODE;
-    if (moe_token_counter < interval) {
+    if (ubatch.n_tokens > 1 || moe_token_counter < MOE_RECLASSIFY_INTERVAL_DECODE) {
         return;
     }
 
-    // Prompt batches keep their overshoot. On the prompt-to-decode transition,
-    // consume the accumulated prompt remainder as one update and start a fresh
-    // decode interval instead of causing a second update a few tokens later.
-    moe_token_counter = ubatch.n_tokens > 1 ? moe_token_counter % interval : 0;
+    moe_token_counter = 0;
     if (moe_auto_mode) {
         update_moe_hot_auto();
     }
