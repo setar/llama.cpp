@@ -874,15 +874,12 @@ typedef struct {
     uint64_t nb1;
 } ggml_metal_kargs_dsv4_hc_weighted_sum;
 
-#ifndef GGML_DSV4_STATE_COMPRESS_MAX_RATIO
-#define GGML_DSV4_STATE_COMPRESS_MAX_RATIO 8
-#endif
-
 typedef struct {
     int64_t  n_embd_head;
     int64_t  n_blocks;
     int64_t  n_rows;
     int64_t  ratio;
+    int32_t  flat;
     uint64_t nb_kv0;
     uint64_t nb_kv1;
     uint64_t nb_sc0;

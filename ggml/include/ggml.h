@@ -225,8 +225,6 @@
 #define GGML_MAX_N_THREADS      512
 #define GGML_MAX_OP_PARAMS      64
 
-// stack budget for the fused DSV4 state compression (2*ratio entries)
-#define GGML_DSV4_STATE_COMPRESS_MAX_RATIO 8
 
 #ifndef GGML_MAX_NAME
 #   define GGML_MAX_NAME        64
@@ -2690,6 +2688,20 @@ extern "C" {
     // idxs:        I32 [2*ratio*n_blocks]
     // dst:         F32 [n_embd_head, 1, n_blocks]
     GGML_API struct ggml_tensor * ggml_dsv4_state_compress(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kv_state,
+            struct ggml_tensor  * score_state,
+            struct ggml_tensor  * idxs,
+            int                   ratio);
+
+    // Flat variant (HCA): rows are full-width, one gather list.
+    //   row = idxs[b*ratio + j], j in [0, ratio), col = d
+    //
+    // kv_state:    F32 [n_embd_head, n_rows]
+    // score_state: F32 [n_embd_head, n_rows]
+    // idxs:        I32 [ratio*n_blocks]
+    // dst:         F32 [n_embd_head, 1, n_blocks]
+    GGML_API struct ggml_tensor * ggml_dsv4_state_compress_flat(
             struct ggml_context * ctx,
             struct ggml_tensor  * kv_state,
             struct ggml_tensor  * score_state,

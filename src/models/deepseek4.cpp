@@ -493,21 +493,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_compressed_kv_from_state(
     GGML_ASSERT(state_read_idxs->ne[0] == DSV4_HCA_RATIO*n_blocks);
     GGML_ASSERT(n_embd_head >= n_embd_head_rope);
 
-    ggml_tensor * kv = ggml_get_rows(ctx0, kv_state, state_read_idxs);
-    kv = ggml_reshape_3d(ctx0, kv, n_embd_head, DSV4_HCA_RATIO, n_blocks);
-    cb(kv, name, il);
-
-    ggml_tensor * score = ggml_get_rows(ctx0, score_state, state_read_idxs);
-    score = ggml_reshape_3d(ctx0, score, n_embd_head, DSV4_HCA_RATIO, n_blocks);
-    cb(score, name, il);
-
-    ggml_tensor * values = ggml_cont(ctx0, ggml_permute(ctx0, kv, 1, 0, 2, 3));
-    ggml_tensor * scores = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));
-
-    ggml_tensor * weights = ggml_soft_max(ctx0, scores);
-    ggml_tensor * comp = ggml_mul(ctx0, values, weights);
-    comp = ggml_sum_rows(ctx0, comp);
-    comp = ggml_cont(ctx0, ggml_permute(ctx0, comp, 1, 0, 2, 3));
+    // fused gather + per-channel softmax + weighted sum over DSV4_HCA_RATIO entries
+    ggml_tensor * comp = ggml_dsv4_state_compress_flat(ctx0, kv_state, score_state, state_read_idxs, DSV4_HCA_RATIO);
     cb(comp, name, il);
 
     comp = build_norm(comp, norm, nullptr, LLM_NORM_RMS, il);

@@ -11399,12 +11399,14 @@ void ggml_compute_forward_dsv4_state_compress(
     GGML_ASSERT(dst->type         == GGML_TYPE_F32);
 
     const int64_t ratio       = ggml_get_op_params_i32(dst, 0);
+    const bool    flat        = ggml_get_op_params_i32(dst, 1) != 0;
     const int64_t n_embd_head = dst->ne[0];
     const int64_t n_blocks    = dst->ne[2];
     const int64_t n_rows      = kv_state->ne[1];
+    const int64_t n_entries   = flat ? ratio : 2*ratio;
 
-    GGML_ASSERT(kv_state->ne[0] == 2*n_embd_head);
-    GGML_ASSERT(idxs->ne[0] == 2*ratio*n_blocks);
+    GGML_ASSERT(kv_state->ne[0] == (flat ? n_embd_head : 2*n_embd_head));
+    GGML_ASSERT(idxs->ne[0] == n_entries*n_blocks);
 
     const int64_t n_elem = n_embd_head*n_blocks;
 
@@ -11420,37 +11422,42 @@ void ggml_compute_forward_dsv4_state_compress(
         const int64_t d = i % n_embd_head;
         const int64_t b = i / n_embd_head;
 
-        float sc[2*GGML_DSV4_STATE_COMPRESS_MAX_RATIO];
-        float kv[2*GGML_DSV4_STATE_COMPRESS_MAX_RATIO];
-
-        float smax = -INFINITY;
-        for (int64_t j = 0; j < 2*ratio; ++j) {
-            const int64_t half = j < ratio ? 0 : 1;
-            const int64_t row  = ii[half*ratio*n_blocks + b*ratio + (j % ratio)];
-            const int64_t col  = half*n_embd_head + d;
-
-            if (row >= 0 && row < n_rows) {
-                sc[j] = *(const float *) (sc_data + col*score_state->nb[0] + row*score_state->nb[1]);
-                kv[j] = *(const float *) (kv_data + col*kv_state->nb[0]    + row*kv_state->nb[1]);
-            } else {
-                sc[j] = -INFINITY;
-                kv[j] = 0.0f;
-            }
-            smax = MAX(smax, sc[j]);
-        }
-
+        // online softmax over the gathered entries
+        float m   = -INFINITY;
+        float sum = 0.0f;
         float acc = 0.0f;
-        if (smax > -INFINITY) {
-            float sum = 0.0f;
-            for (int64_t j = 0; j < 2*ratio; ++j) {
-                const float e = expf(sc[j] - smax);
-                acc += e*kv[j];
-                sum += e;
+
+        for (int64_t j = 0; j < n_entries; ++j) {
+            const int64_t side = (flat || j < ratio) ? 0 : 1;
+            const int64_t row  = flat
+                ? ii[b*ratio + j]
+                : ii[side*ratio*n_blocks + b*ratio + (j % ratio)];
+            const int64_t col  = side*n_embd_head + d;
+
+            float sc, kv;
+            if (row >= 0 && row < n_rows) {
+                sc = *(const float *) (sc_data + col*score_state->nb[0] + row*score_state->nb[1]);
+                kv = *(const float *) (kv_data + col*kv_state->nb[0]    + row*kv_state->nb[1]);
+            } else {
+                continue; // pad: score = -inf contributes nothing
             }
-            acc /= sum;
+
+            if (sc == -INFINITY) {
+                continue;
+            }
+
+            if (sc > m) {
+                const float r = expf(m - sc);
+                sum *= r;
+                acc *= r;
+                m    = sc;
+            }
+            const float e = expf(sc - m);
+            sum += e;
+            acc += e*kv;
         }
 
-        *(float *) (y_data + d*dst->nb[0] + b*dst->nb[2]) = acc;
+        *(float *) (y_data + d*dst->nb[0] + b*dst->nb[2]) = sum > 0.0f ? acc/sum : 0.0f;
     }
 }
 

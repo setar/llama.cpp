@@ -6573,7 +6573,7 @@ struct ggml_tensor * ggml_dsv4_state_compress(
     GGML_ASSERT(score_state->type == GGML_TYPE_F32);
     GGML_ASSERT(idxs->type        == GGML_TYPE_I32);
 
-    GGML_ASSERT(ratio > 0 && ratio <= GGML_DSV4_STATE_COMPRESS_MAX_RATIO);
+    GGML_ASSERT(ratio > 0);
     GGML_ASSERT(kv_state->ne[0] % 2 == 0);
     GGML_ASSERT(kv_state->ne[0] == score_state->ne[0]);
     GGML_ASSERT(kv_state->ne[1] == score_state->ne[1]);
@@ -6590,6 +6590,45 @@ struct ggml_tensor * ggml_dsv4_state_compress(
     struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd_head, 1, n_blocks);
 
     ggml_set_op_params_i32(result, 0, ratio);
+    ggml_set_op_params_i32(result, 1, 0); // split mode
+
+    result->op     = GGML_OP_DSV4_STATE_COMPRESS;
+    result->src[0] = kv_state;
+    result->src[1] = score_state;
+    result->src[2] = idxs;
+
+    return result;
+}
+
+// ggml_dsv4_state_compress_flat
+
+struct ggml_tensor * ggml_dsv4_state_compress_flat(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kv_state,
+        struct ggml_tensor  * score_state,
+        struct ggml_tensor  * idxs,
+        int                   ratio) {
+    GGML_ASSERT(kv_state->type    == GGML_TYPE_F32);
+    GGML_ASSERT(score_state->type == GGML_TYPE_F32);
+    GGML_ASSERT(idxs->type        == GGML_TYPE_I32);
+
+    GGML_ASSERT(ratio > 0);
+    GGML_ASSERT(kv_state->ne[0] == score_state->ne[0]);
+    GGML_ASSERT(kv_state->ne[1] == score_state->ne[1]);
+    GGML_ASSERT(kv_state->ne[2] == 1);
+    GGML_ASSERT(kv_state->ne[3] == 1);
+    GGML_ASSERT(score_state->ne[2] == 1);
+    GGML_ASSERT(score_state->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(idxs));
+    GGML_ASSERT(idxs->ne[0] % ratio == 0);
+
+    const int64_t n_embd_head = kv_state->ne[0];
+    const int64_t n_blocks    = idxs->ne[0]/ratio;
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd_head, 1, n_blocks);
+
+    ggml_set_op_params_i32(result, 0, ratio);
+    ggml_set_op_params_i32(result, 1, 1); // flat mode
 
     result->op     = GGML_OP_DSV4_STATE_COMPRESS;
     result->src[0] = kv_state;

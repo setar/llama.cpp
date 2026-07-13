@@ -1990,6 +1990,7 @@ int ggml_metal_op_dsv4_state_compress(ggml_metal_op_t ctx, int idx) {
         /*.n_blocks    =*/ op->ne[2],
         /*.n_rows      =*/ kv_state->ne[1],
         /*.ratio       =*/ ratio,
+        /*.flat        =*/ ggml_get_op_params_i32(op, 1),
         /*.nb_kv0      =*/ kv_state->nb[0],
         /*.nb_kv1      =*/ kv_state->nb[1],
         /*.nb_sc0      =*/ score_state->nb[0],

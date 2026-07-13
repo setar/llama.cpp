@@ -2434,37 +2434,44 @@ kernel void kernel_dsv4_state_compress(
 
     device const int32_t * ii = (device const int32_t *) idxs;
 
-    float sc[2*GGML_DSV4_STATE_COMPRESS_MAX_RATIO];
-    float kv[2*GGML_DSV4_STATE_COMPRESS_MAX_RATIO];
+    const bool    flat      = args.flat != 0;
+    const int64_t n_entries = flat ? args.ratio : 2*args.ratio;
 
-    float smax = -INFINITY;
-    for (int64_t j = 0; j < 2*args.ratio; ++j) {
-        const int64_t side = j < args.ratio ? 0 : 1;
-        const int64_t row  = ii[side*args.ratio*args.n_blocks + b*args.ratio + (j % args.ratio)];
+    // online softmax over the gathered entries
+    float m   = -INFINITY;
+    float sum = 0.0f;
+    float acc = 0.0f;
+
+    for (int64_t j = 0; j < n_entries; ++j) {
+        const int64_t side = (flat || j < args.ratio) ? 0 : 1;
+        const int64_t row  = flat
+            ? ii[b*args.ratio + j]
+            : ii[side*args.ratio*args.n_blocks + b*args.ratio + (j % args.ratio)];
         const int64_t col  = side*args.n_embd_head + d;
 
-        if (row >= 0 && row < args.n_rows) {
-            sc[j] = *((device const float *) (score_state + col*args.nb_sc0 + row*args.nb_sc1));
-            kv[j] = *((device const float *) (kv_state    + col*args.nb_kv0 + row*args.nb_kv1));
-        } else {
-            sc[j] = -INFINITY;
-            kv[j] = 0.0f;
+        if (row < 0 || row >= args.n_rows) {
+            continue; // pad: score = -inf contributes nothing
         }
-        smax = max(smax, sc[j]);
+
+        const float sc = *((device const float *) (score_state + col*args.nb_sc0 + row*args.nb_sc1));
+        const float kv = *((device const float *) (kv_state    + col*args.nb_kv0 + row*args.nb_kv1));
+
+        if (sc == -INFINITY) {
+            continue;
+        }
+
+        if (sc > m) {
+            const float r = exp(m - sc);
+            sum *= r;
+            acc *= r;
+            m    = sc;
+        }
+        const float e = exp(sc - m);
+        sum += e;
+        acc += e*kv;
     }
 
-    float acc = 0.0f;
-    if (smax > -INFINITY) {
-        float sum = 0.0f;
-        for (int64_t j = 0; j < 2*args.ratio; ++j) {
-            const float e = exp(sc[j] - smax);
-            acc += e*kv[j];
-            sum += e;
-        }
-        acc /= sum;
-    }
-
-    *((device float *) (dst + d*args.nb0 + b*args.nb2)) = acc;
+    *((device float *) (dst + d*args.nb0 + b*args.nb2)) = sum > 0.0f ? acc/sum : 0.0f;
 }
 
 template<typename KT, typename KT4>
