@@ -2127,7 +2127,14 @@ int ggml_metal_op_lightning_indexer(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(m),  4);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 5);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, args.n_kv, args.n_tokens, args.n_stream, 32, 1, 1);
+    // keep in sync with the tile condition in ggml_metal_library_get_pipeline_lightning_indexer
+    const bool tile = args.n_tokens >= 8 && args.n_embd == 128 && args.n_head <= 64;
+
+    if (tile) {
+        ggml_metal_encoder_dispatch_threadgroups(enc, (args.n_kv + 63)/64, (args.n_tokens + 7)/8, args.n_stream, 256, 1, 1);
+    } else {
+        ggml_metal_encoder_dispatch_threadgroups(enc, args.n_kv, args.n_tokens, args.n_stream, 32, 1, 1);
+    }
 
     return 1;
 }

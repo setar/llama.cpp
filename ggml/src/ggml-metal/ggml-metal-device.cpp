@@ -575,8 +575,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexe
     GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16);
     GGML_ASSERT(op->type == GGML_TYPE_F32);
 
+    // tiled variant for large batches (prefill); the per-pair kernel stays for small nt (decode)
+    const bool tile = op->src[0]->ne[2] >= 8 && op->src[0]->ne[0] == 128 && op->src[0]->ne[1] <= 64;
+
     char name[256];
-    snprintf(name, 256, "kernel_lightning_indexer_%s", ggml_type_name(op->src[1]->type));
+    snprintf(name, 256, "kernel_lightning_indexer_%s%s", tile ? "tile_" : "", ggml_type_name(op->src[1]->type));
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {

@@ -2523,6 +2523,129 @@ typedef decltype(kernel_lightning_indexer<float, float4>) kernel_lightning_index
 template [[host_name("kernel_lightning_indexer_f32")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<float, float4>;
 template [[host_name("kernel_lightning_indexer_f16")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<half,  half4>;
 
+// tiled variant for large batches (prefill): a threadgroup computes a
+// [LID_NKV x LID_NT] tile of the output. the K tile is staged in threadgroup
+// memory once and reused by all heads; per head the [LID_NT x n_embd] Q tile
+// is staged and multiplied via simdgroup 8x8 matrices, then ReLU*w is applied
+// elementwise and accumulated. requires n_embd == 128 and n_head <= 64.
+#define LID_NKV 64 // KV rows per threadgroup
+#define LID_NT   8 // tokens per threadgroup
+#define LID_NSG  8 // simdgroups per threadgroup (one 8x8 output tile each)
+
+template<typename KT, typename KT4>
+kernel void kernel_lightning_indexer_tile(
+        constant ggml_metal_kargs_lightning_indexer & args,
+        device  const char * q,
+        device  const char * k,
+        device  const char * w,
+        device  const char * m,
+        device        char * dst,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NTH = 32*LID_NSG;
+
+    threadgroup half  sk  [LID_NKV*128];       // K tile (shared across heads)
+    threadgroup half  sq  [LID_NT*128];        // Q tile for the current head
+    threadgroup float sw  [LID_NT*64];         // indexer weights [token][head]
+    threadgroup float ss  [LID_NSG*64];        // per-simdgroup 8x8 scratch
+    threadgroup float sacc[LID_NKV*LID_NT];    // output accumulator
+
+    const int ikv0 = tgpig.x*LID_NKV;
+    const int it0  = tgpig.y*LID_NT;
+    const int s    = tgpig.z;
+
+    // stage K tile: LID_NKV rows x 128 dims, zero-pad rows beyond n_kv
+    for (int i = tiitg; i < LID_NKV*32; i += NTH) {
+        const int r = i/32; // kv row in tile
+        const int c = i%32; // half4 column
+        threadgroup half4 * sk4 = (threadgroup half4 *) sk;
+        if (ikv0 + r < args.n_kv) {
+            device const KT4 * k4 = (device const KT4 *) (k + (ikv0 + r)*args.nbk2 + s*args.nbk3);
+            sk4[i] = half4(k4[c]);
+        } else {
+            sk4[i] = half4(0.0f);
+        }
+    }
+
+    // stage weights: [LID_NT][64], zero-pad tokens beyond n_tokens
+    for (int i = tiitg; i < LID_NT*64; i += NTH) {
+        const int tt = i/64;
+        const int h  = i%64;
+        if (it0 + tt < args.n_tokens && h < args.n_head) {
+            sw[i] = ((device const float *) (w + (it0 + tt)*args.nbw1 + s*args.nbw3))[h];
+        } else {
+            sw[i] = 0.0f;
+        }
+    }
+
+    for (int i = tiitg; i < LID_NKV*LID_NT; i += NTH) {
+        sacc[i] = 0.0f;
+    }
+
+    for (int h = 0; h < args.n_head; ++h) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // stage Q tile for head h: [LID_NT][128] f32 -> half
+        for (int i = tiitg; i < LID_NT*32; i += NTH) {
+            const int tt = i/32;
+            const int c  = i%32;
+            threadgroup half4 * sq4 = (threadgroup half4 *) sq;
+            if (it0 + tt < args.n_tokens) {
+                device const float4 * q4 = (device const float4 *) (q + h*args.nbq1 + (it0 + tt)*args.nbq2 + s*args.nbq3);
+                sq4[i] = half4(q4[c]);
+            } else {
+                sq4[i] = half4(0.0f);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // S = K_tile x Q_tile^T : each simdgroup owns 8 kv rows
+        simdgroup_float8x8 C = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        for (int kk = 0; kk < 16; ++kk) {
+            simdgroup_half8x8 A; // [8 kv][8 dim]
+            simdgroup_load(A, sk + sgitg*8*128 + kk*8, 128);
+            simdgroup_half8x8 B; // [8 dim][8 tok] (transposed load)
+            simdgroup_load(B, sq + kk*8, 128, 0, true);
+            simdgroup_multiply_accumulate(C, A, B, C);
+        }
+        simdgroup_store(C, ss + sgitg*64, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // acc += ReLU(S) * w[h][t]
+        for (int e = tiisg; e < 64; e += 32) {
+            const int kvr = e/8;
+            const int tt  = e%8;
+            sacc[(sgitg*8 + kvr)*LID_NT + tt] += max(ss[sgitg*64 + e], 0.0f) * sw[tt*64 + h];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // add mask and write out
+    for (int i = tiitg; i < LID_NKV*LID_NT; i += NTH) {
+        const int kvr = i/LID_NT;
+        const int tt  = i%LID_NT;
+        const int ikv = ikv0 + kvr;
+        const int t   = it0  + tt;
+        if (ikv < args.n_kv && t < args.n_tokens) {
+            device const char * m_row = m + t*args.nbm1 + (s % args.nem3)*args.nbm3;
+            const float mv = args.mask_f16
+                ? (float) ((device const half  *) m_row)[ikv]
+                :         ((device const float *) m_row)[ikv];
+
+            ((device float *) (dst + t*args.nb1 + s*args.nb3))[ikv] = sacc[i] + mv;
+        }
+    }
+}
+
+typedef decltype(kernel_lightning_indexer_tile<float, float4>) kernel_lightning_indexer_tile_t;
+
+template [[host_name("kernel_lightning_indexer_tile_f32")]] kernel kernel_lightning_indexer_tile_t kernel_lightning_indexer_tile<float, float4>;
+template [[host_name("kernel_lightning_indexer_tile_f16")]] kernel kernel_lightning_indexer_tile_t kernel_lightning_indexer_tile<half,  half4>;
+
 kernel void kernel_topk_moe_sqrtsoftplus_f32(
         constant ggml_metal_kargs_topk_moe_sqrtsoftplus & args,
         device const float   * logits,

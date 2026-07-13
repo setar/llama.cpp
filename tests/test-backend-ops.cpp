@@ -7339,7 +7339,8 @@ struct test_lightning_indexer : public test_case {
     }
 
     double max_nmse_err() override {
-        return 1e-6;
+        // the Metal tile kernel computes q*k in f16 (like MUL_MAT)
+        return 5e-4;
     }
 
     uint64_t op_flops(ggml_tensor * t) override {
@@ -9797,6 +9798,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                         test_cases.emplace_back(new test_lightning_indexer(128, nh, kv, bs, ns, nm, type_K));
                     }
                 }
+            }
+        }
+    }
+    // tile kernel tails: kv % 64 != 0, bs % 8 != 0
+    for (int kv : { 67, 1000 }) {
+        for (int bs : { 7, 8, 33, 512 }) {
+            for (ggml_type type_K : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+                test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, bs, 1, 1, type_K));
             }
         }
     }
