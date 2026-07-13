@@ -2087,6 +2087,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_expand(params, tensor);
             } break;
+        case GGML_OP_DSV4_STATE_COMPRESS:
+            {
+                ggml_compute_forward_dsv4_state_compress(params, tensor);
+            } break;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
@@ -2277,6 +2281,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
         case GGML_OP_DSV4_HC_WEIGHTED_SUM:
         case GGML_OP_DSV4_HC_EXPAND:
+        case GGML_OP_DSV4_STATE_COMPRESS:
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 n_tasks = n_threads;

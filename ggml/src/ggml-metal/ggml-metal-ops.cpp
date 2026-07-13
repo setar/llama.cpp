@@ -437,6 +437,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_dsv4_hc_weighted_sum(ctx, idx);
             } break;
+        case GGML_OP_DSV4_STATE_COMPRESS:
+            {
+                n_fuse = ggml_metal_op_dsv4_state_compress(ctx, idx);
+            } break;
         case GGML_OP_DSV4_HC_EXPAND:
             {
                 n_fuse = ggml_metal_op_dsv4_hc_expand(ctx, idx);
@@ -1958,6 +1962,54 @@ int ggml_metal_op_dsv4_hc_weighted_sum(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),       1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(weights), 2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),      3);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, n_tg, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_dsv4_state_compress(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    ggml_tensor * kv_state    = op->src[0];
+    ggml_tensor * score_state = op->src[1];
+    ggml_tensor * idxs        = op->src[2];
+
+    GGML_ASSERT(kv_state->type    == GGML_TYPE_F32);
+    GGML_ASSERT(score_state->type == GGML_TYPE_F32);
+    GGML_ASSERT(idxs->type        == GGML_TYPE_I32);
+    GGML_ASSERT(op->type          == GGML_TYPE_F32);
+
+    const int32_t ratio = ggml_get_op_params_i32(op, 0);
+
+    ggml_metal_kargs_dsv4_state_compress args = {
+        /*.n_embd_head =*/ op->ne[0],
+        /*.n_blocks    =*/ op->ne[2],
+        /*.n_rows      =*/ kv_state->ne[1],
+        /*.ratio       =*/ ratio,
+        /*.nb_kv0      =*/ kv_state->nb[0],
+        /*.nb_kv1      =*/ kv_state->nb[1],
+        /*.nb_sc0      =*/ score_state->nb[0],
+        /*.nb_sc1      =*/ score_state->nb[1],
+        /*.nb0         =*/ op->nb[0],
+        /*.nb2         =*/ op->nb[2],
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_dsv4_state_compress(lib, op);
+
+    const int64_t n_elem = op->ne[0]*op->ne[2];
+    const int nth = std::min<int64_t>(256, std::max<int64_t>(1, n_elem));
+    const int n_tg = (n_elem + nth - 1) / nth;
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(kv_state),    1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(score_state), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(idxs),        3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),          4);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, n_tg, 1, 1, nth, 1, 1);
 

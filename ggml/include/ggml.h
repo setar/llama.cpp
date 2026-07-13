@@ -225,6 +225,9 @@
 #define GGML_MAX_N_THREADS      512
 #define GGML_MAX_OP_PARAMS      64
 
+// stack budget for the fused DSV4 state compression (2*ratio entries)
+#define GGML_DSV4_STATE_COMPRESS_MAX_RATIO 8
+
 #ifndef GGML_MAX_NAME
 #   define GGML_MAX_NAME        64
 #endif
@@ -577,6 +580,7 @@ extern "C" {
         GGML_OP_DSV4_HC_SPLIT_SINKHORN,
         GGML_OP_DSV4_HC_WEIGHTED_SUM,
         GGML_OP_DSV4_HC_EXPAND,
+        GGML_OP_DSV4_STATE_COMPRESS,
         GGML_OP_LIGHTNING_INDEXER,
 
         GGML_OP_UNARY,
@@ -2671,6 +2675,26 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // DeepSeek V4 overlap-compressed state helper.
+    // Fuses the gather + softmax + weighted-sum chain of the CSA/LID state
+    // compression. Rows of kv_state/score_state hold [prev | cur] halves of
+    // width n_embd_head = ne0/2 each. For block b, entry j in [0, 2*ratio):
+    //   row = idxs[(j < ratio ? 0 : ratio*n_blocks) + b*ratio + (j % ratio)]
+    //   col = (j < ratio ? 0 : n_embd_head) + d
+    // Out-of-range rows (idx >= n_rows) read as kv = 0, score = -inf.
+    // dst[d, 0, b] = sum_j softmax_j(score[j]) * kv[j]
+    //
+    // kv_state:    F32 [2*n_embd_head, n_rows]
+    // score_state: F32 [2*n_embd_head, n_rows]
+    // idxs:        I32 [2*ratio*n_blocks]
+    // dst:         F32 [n_embd_head, 1, n_blocks]
+    GGML_API struct ggml_tensor * ggml_dsv4_state_compress(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kv_state,
+            struct ggml_tensor  * score_state,
+            struct ggml_tensor  * idxs,
+            int                   ratio);
 
     // DSA lightning indexer
     //

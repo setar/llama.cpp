@@ -2417,6 +2417,56 @@ kernel void kernel_dsv4_hc_weighted_sum(
 }
 
 
+kernel void kernel_dsv4_state_compress(
+        constant ggml_metal_kargs_dsv4_state_compress & args,
+        device  const char * kv_state,
+        device  const char * score_state,
+        device  const char * idxs,
+        device        char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const int64_t n_elem = args.n_embd_head * args.n_blocks;
+    if ((int64_t) gid >= n_elem) {
+        return;
+    }
+
+    const int64_t d = ((int64_t) gid) % args.n_embd_head;
+    const int64_t b = ((int64_t) gid) / args.n_embd_head;
+
+    device const int32_t * ii = (device const int32_t *) idxs;
+
+    float sc[2*GGML_DSV4_STATE_COMPRESS_MAX_RATIO];
+    float kv[2*GGML_DSV4_STATE_COMPRESS_MAX_RATIO];
+
+    float smax = -INFINITY;
+    for (int64_t j = 0; j < 2*args.ratio; ++j) {
+        const int64_t side = j < args.ratio ? 0 : 1;
+        const int64_t row  = ii[side*args.ratio*args.n_blocks + b*args.ratio + (j % args.ratio)];
+        const int64_t col  = side*args.n_embd_head + d;
+
+        if (row >= 0 && row < args.n_rows) {
+            sc[j] = *((device const float *) (score_state + col*args.nb_sc0 + row*args.nb_sc1));
+            kv[j] = *((device const float *) (kv_state    + col*args.nb_kv0 + row*args.nb_kv1));
+        } else {
+            sc[j] = -INFINITY;
+            kv[j] = 0.0f;
+        }
+        smax = max(smax, sc[j]);
+    }
+
+    float acc = 0.0f;
+    if (smax > -INFINITY) {
+        float sum = 0.0f;
+        for (int64_t j = 0; j < 2*args.ratio; ++j) {
+            const float e = exp(sc[j] - smax);
+            acc += e*kv[j];
+            sum += e;
+        }
+        acc /= sum;
+    }
+
+    *((device float *) (dst + d*args.nb0 + b*args.nb2)) = acc;
+}
+
 template<typename KT, typename KT4>
 kernel void kernel_lightning_indexer(
         constant ggml_metal_kargs_lightning_indexer & args,

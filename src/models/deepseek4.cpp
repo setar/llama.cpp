@@ -188,10 +188,6 @@ static size_t dsv4_elem_offset(const ggml_tensor * t, int64_t i) {
     return ggml_row_size(t->type, i);
 }
 
-static ggml_tensor * dsv4_view_1d(ggml_context * ctx, ggml_tensor * t, int64_t ne0, int64_t i0) {
-    return ggml_view_1d(ctx, t, ne0, dsv4_elem_offset(t, i0));
-}
-
 static ggml_tensor * dsv4_view_2d(
         ggml_context * ctx,
         ggml_tensor  * t,
@@ -213,6 +209,10 @@ struct dsv4_state_tensors {
     ggml_tensor * kv;
     ggml_tensor * score;
 };
+static ggml_tensor * dsv4_with_zero_dep(ggml_context * ctx, ggml_tensor * t, ggml_tensor * dep) {
+    if (dep == nullptr) {
+        return t;
+    }
 
 static dsv4_state_tensors dsv4_build_state_restore(
         ggml_context * ctx,
@@ -592,6 +592,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_overlap_compressed_kv_from_sta
     ggml_tensor * comp = ggml_mul(ctx0, values, weights);
     comp = ggml_sum_rows(ctx0, comp);
     comp = ggml_cont(ctx0, ggml_permute(ctx0, comp, 1, 0, 2, 3));
+    // fused gather + per-channel softmax + weighted sum; out-of-range idxs
+    // (the appended zero row in the unfused version) pad as kv = 0, score = -inf
+    ggml_tensor * comp = ggml_dsv4_state_compress(ctx0, kv_state, score_state, state_read_idxs, ratio);
     cb(comp, name, il);
 
     comp = build_norm(comp, norm, nullptr, LLM_NORM_RMS, il);
