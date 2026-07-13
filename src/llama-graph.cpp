@@ -2237,6 +2237,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_biased", il);
     }
 
+    // fused expert aggregation: one weighted-sum kernel instead of
+    // mul + n_expert_used views + (n_expert_used - 1) adds per layer
+    if (arch == LLM_ARCH_DEEPSEEK4 && !weight_before_ffn) {
+        ggml_tensor * w2d = ggml_reshape_2d(ctx0, weights, weights->ne[1], weights->ne[2]);
+        ggml_tensor * moe_out = ggml_dsv4_hc_weighted_sum(ctx0, experts, w2d);
+        ggml_build_forward_expand(gf, moe_out);
+        cb(moe_out, "ffn_moe_out", il);
+        return moe_out;
+    }
+
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
