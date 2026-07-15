@@ -582,6 +582,13 @@ class DeepseekV4Model(TextModel):
             with open(template_path, "r", encoding="utf-8") as f:
                 self.gguf_writer.add_chat_template(f.read())
 
+    def set_vocab(self):
+        if DSV4_DSPARK_MODE:
+            # the draft module shares the tokenizer and embeddings with the main model
+            self._set_vocab_none()
+            return
+        super().set_vocab()
+
     def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
         type(self)._dsv4_main_layers = self.hparams["num_hidden_layers"]
         type(self)._dsv4_nextn_layers = self.hparams.get("num_nextn_predict_layers", 0)
