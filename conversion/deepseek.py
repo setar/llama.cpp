@@ -519,7 +519,7 @@ class DeepseekV32Model(DeepseekV2Model):
 
 # DSV4_DSPARK=1 switches the converter to extracting the DSpark speculative
 # module (mtp.* tensors) into a standalone deepseek4-dspark GGUF; embed and
-# lm_head are shared with the main model and are not duplicated
+# head are copied from the main checkpoint so the draft is self-contained
 DSV4_DSPARK_MODE = os.environ.get("DSV4_DSPARK", "") == "1"
 
 
@@ -598,6 +598,8 @@ class DeepseekV4Model(TextModel):
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item
         if DSV4_DSPARK_MODE:
+            if name in ("embed.weight", "head.weight"):
+                return item
             if not name.startswith("mtp."):
                 return None
             # rename mtp.N.* -> layers.N.* so the regular DSV4 machinery
