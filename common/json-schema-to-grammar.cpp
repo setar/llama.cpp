@@ -15,6 +15,13 @@
 using json = nlohmann::ordered_json;
 
 static std::string build_repetition(const std::string & item_rule, int min_items, int max_items, const std::string & separator_rule = "") {
+    // the grammar parser rejects repetitions above MAX_REPETITION_THRESHOLD (llama-grammar.cpp);
+    // schemas with huge maxLength/maxItems (e.g. 524288) must degrade to an unbounded repetition
+    static const int GRAMMAR_MAX_REPETITION = 512;
+    min_items = std::min(min_items, GRAMMAR_MAX_REPETITION);
+    if (max_items != std::numeric_limits<int>::max() && max_items > GRAMMAR_MAX_REPETITION) {
+        max_items = std::numeric_limits<int>::max();
+    }
     auto has_max = max_items != std::numeric_limits<int>::max();
 
     if (max_items == 0) {
