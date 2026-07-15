@@ -1406,6 +1406,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
     cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
     cb(cur, "hc_head", -1);
+    res->t_h_nextn = cur;
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);

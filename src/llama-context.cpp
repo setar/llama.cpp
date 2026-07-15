@@ -2808,6 +2808,8 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         for (const auto & lora : model.loras) {
             res += lora->get_n_nodes();
         }
+        model.arch == LLM_ARCH_DEEPSEEK4_DSPARK) {
+        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
 
     uint32_t n_sampling_nodes = 0;

@@ -1778,6 +1778,7 @@ ggml_tensor * llm_graph_context::build_ffn(
                         cb(tmp, "ffn_up_clamped", il);
 
                         if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
+                        if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK4_DSPARK) {
                             cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
                             cb(cur, "ffn_gate_clamped", il);
                             cur = ggml_swiglu_split(ctx0, cur, tmp);
@@ -2173,6 +2174,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                         cb(up, "ffn_moe_up_clamped", il);
 
                         if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
+                        if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK4_DSPARK) {
                             cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
                             cb(cur, "ffn_moe_gate_clamped", il);
                             cur = ggml_swiglu_split(ctx0, cur, up);
@@ -2247,7 +2249,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // fused expert aggregation: one weighted-sum kernel instead of
     // mul + n_expert_used views + (n_expert_used - 1) adds per layer
-    if (arch == LLM_ARCH_DEEPSEEK4 && !weight_before_ffn) {
+    if ((arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK4_DSPARK) && !weight_before_ffn) {
         ggml_tensor * w2d = ggml_reshape_2d(ctx0, weights, weights->ne[1], weights->ne[2]);
         ggml_tensor * moe_out = ggml_dsv4_hc_weighted_sum(ctx0, experts, w2d);
         ggml_build_forward_expand(gf, moe_out);

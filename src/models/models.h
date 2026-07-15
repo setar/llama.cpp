@@ -1299,6 +1299,18 @@ struct llama_model_deepseek4_dspark : public llama_model_deepseek4 {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    // main_hidden -> main_x fusion (encode)
+    struct graph_enc : public llm_graph_context {
+        graph_enc(const llama_model & model, const llm_graph_params & params);
+    };
+
+    // cache-fill of wkv(main_x) rows (decode with embd batch)
+    struct graph_inject : public llm_graph_context {
+        graph_inject(const llama_model & model, const llm_graph_params & params);
+    };
+
+    // draft blocks (decode with token batch) reuse llama_model_deepseek4::graph
+
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
