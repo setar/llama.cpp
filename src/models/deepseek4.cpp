@@ -1397,6 +1397,8 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
             mean_w = ggml_fill(ctx0, mean_w, 1.0f/hc);
             res->t_layer_inp[il] = build_hc_weighted_sum(inpL, mean_w);
             cb(res->t_layer_inp[il], "dspark_main_hidden", il);
+            // side branch with no consumers — expand it into the graph explicitly
+            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
         }
     }
 
