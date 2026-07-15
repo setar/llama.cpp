@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 
@@ -516,9 +517,15 @@ class DeepseekV32Model(DeepseekV2Model):
         self.gguf_writer.add_indexer_top_k(self.hparams["index_topk"])
 
 
+# DSV4_DSPARK=1 switches the converter to extracting the DSpark speculative
+# module (mtp.* tensors) into a standalone deepseek4-dspark GGUF; embed and
+# lm_head are shared with the main model and are not duplicated
+DSV4_DSPARK_MODE = os.environ.get("DSV4_DSPARK", "") == "1"
+
+
 @ModelBase.register("DeepseekV4ForCausalLM")
 class DeepseekV4Model(TextModel):
-    model_arch = gguf.MODEL_ARCH.DEEPSEEK4
+    model_arch = gguf.MODEL_ARCH.DEEPSEEK4DSPARK if DSV4_DSPARK_MODE else gguf.MODEL_ARCH.DEEPSEEK4
     supports_mtp_export = True
     _skipped_mtp_tensors = 0
     _dsv4_main_layers: int | None = None
@@ -541,7 +548,19 @@ class DeepseekV4Model(TextModel):
                 self.rope_parameters.update(**rope_scaling)
 
         self.block_count = self.hparams["num_hidden_layers"]
-        if self.mtp_only:
+        if DSV4_DSPARK_MODE:
+            mtp_layers = {int(m.group(1)) for n in self.model_tensors if (m := re.match(r"layers\.(\d+)\.", n))}
+            self.block_count = max(mtp_layers) + 1
+            self.hparams["num_hidden_layers"] = self.block_count
+            self.hparams["num_hash_layers"] = 0             # mtp blocks route through a regular learned gate
+            self.hparams["compress_ratios"] = [0] * self.block_count  # DSparkAttention asserts compress_ratio == 0
+            # the HF config lacks some DSpark keys; they live in inference/config.json
+            inference_config = self.dir_model / "inference" / "config.json"
+            if inference_config.is_file():
+                with open(inference_config, "r", encoding="utf-8") as f:
+                    self.hparams.setdefault("dspark_target_layer_ids", json.load(f)["dspark_target_layer_ids"])
+            self.hparams.setdefault("dspark_markov_rank", 256)
+        elif self.mtp_only:
             self.block_count += self.hparams.get("num_nextn_predict_layers", 0)
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
 
@@ -571,6 +590,12 @@ class DeepseekV4Model(TextModel):
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item
+        if DSV4_DSPARK_MODE:
+            if not name.startswith("mtp."):
+                return None
+            # rename mtp.N.* -> layers.N.* so the regular DSV4 machinery
+            # (fp8 dequant, MXFP4 expert repacking, name mapping) applies as-is
+            return (re.sub(r"^mtp\.", "layers.", name), gen)
         if name.startswith("mtp."):
             if not cls.mtp_only:
                 cls._skipped_mtp_tensors += 1
@@ -678,6 +703,13 @@ class DeepseekV4Model(TextModel):
             self.gguf_writer.add_embedding_length_out(hparams["hidden_size"] * hparams["hc_mult"])
         if self.mtp_only and (num_nextn_predict_layers := hparams.get("num_nextn_predict_layers", 0)) > 0:
             self.gguf_writer.add_nextn_predict_layers(num_nextn_predict_layers)
+
+        if DSV4_DSPARK_MODE:
+            arch = gguf.MODEL_ARCH_NAMES[self.model_arch]
+            self.gguf_writer.add_uint32(f"{arch}.dspark.block_size", hparams["dspark_block_size"])
+            self.gguf_writer.add_uint32(f"{arch}.dspark.noise_token_id", hparams["dspark_noise_token_id"])
+            self.gguf_writer.add_uint32(f"{arch}.dspark.markov_rank", hparams.get("dspark_markov_rank", 256))
+            self.gguf_writer.add_array(f"{arch}.dspark.target_layer_ids", hparams["dspark_target_layer_ids"])
 
     def dequant_model(self):
         fp8_dtypes = self._float8_dtypes()
@@ -882,6 +914,22 @@ class DeepseekV4Model(TextModel):
             "nextn.embed_tokens.weight": (gguf.MODEL_TENSOR.NEXTN_EMBED_TOKENS, ".weight"),
             "nextn.shared_head_head.weight": (gguf.MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD, ".weight"),
         }
+
+        if DSV4_DSPARK_MODE:
+            # DSpark specials live at block level in the checkpoint (mtp.0 holds the
+            # main-hidden projection, the last block holds the heads); in the GGUF
+            # they map to root-level tensors of the deepseek4-dspark arch
+            layer_map.update({
+                "main_proj.weight":                 (gguf.MODEL_TENSOR.DSPARK_MAIN_PROJ, ".weight"),
+                "main_norm.weight":                 (gguf.MODEL_TENSOR.DSPARK_MAIN_NORM, ".weight"),
+                "markov_head.markov_w1.weight":     (gguf.MODEL_TENSOR.DSPARK_MARKOV_EMBD, ".weight"),
+                "markov_head.markov_w2.weight":     (gguf.MODEL_TENSOR.DSPARK_MARKOV_HEAD, ".weight"),
+                "confidence_head.proj.weight":      (gguf.MODEL_TENSOR.DSPARK_CONF_HEAD, ".weight"),
+                "norm.weight":                      (gguf.MODEL_TENSOR.OUTPUT_NORM, ".weight"),
+                "hc_head_fn":                       (gguf.MODEL_TENSOR.HC_HEAD_FN, ".weight"),
+                "hc_head_base":                     (gguf.MODEL_TENSOR.HC_HEAD_BASE, ".weight"),
+                "hc_head_scale":                    (gguf.MODEL_TENSOR.HC_HEAD_SCALE, ".weight"),
+            })
 
         tensor_name = match.group(2)
         if tensor_name in layer_map:
