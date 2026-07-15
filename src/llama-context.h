@@ -336,6 +336,9 @@ private:
     int32_t moe_hot_count = 0;
     bool moe_auto_mode = false;
     size_t moe_hot_budget_bytes = 0;
+    // effective budget after mlock back-off; 0 = no cap beyond moe_hot_budget_bytes.
+    // shrinks monotonically to the last successfully locked volume when mlock fails
+    size_t moe_hot_budget_backoff_bytes = 0;
     std::vector<int32_t> moe_hot_per_layer;
     std::vector<std::vector<uint64_t>> expert_counts;
     int64_t moe_token_counter = 0;

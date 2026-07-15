@@ -702,6 +702,18 @@ void llama_context::reclassify_moe_experts() {
                 moe_mlock_ok_bytes   / (1024.0 * 1024.0),
                 moe_mlock_fail_bytes / (1024.0 * 1024.0),
                 moe_mlock_fail_errno, strerror(moe_mlock_fail_errno));
+        if (moe_auto_mode) {
+            // back-off: the OS will not lock more than it just did, so retrying the same
+            // volume every reclassify only churns the page cache. Cap the effective
+            // budget slightly below the locked volume; the cap only ever shrinks
+            const size_t backoff = std::max<size_t>((size_t)(moe_mlock_ok_bytes * 0.95), 1);
+            if (moe_hot_budget_backoff_bytes == 0 || backoff < moe_hot_budget_backoff_bytes) {
+                moe_hot_budget_backoff_bytes = backoff;
+                LLAMA_LOG_WARN("%s: MoE hot budget back-off: capping effective budget at %.1f MiB (configured %.1f MiB)\n",
+                        __func__, backoff / (1024.0 * 1024.0), moe_hot_budget_bytes / (1024.0 * 1024.0));
+                apply_moe_hot_budget();
+            }
+        }
     } else {
         LLAMA_LOG_WARN("%s: MoE hot residency: mlock ok = %.1f MiB\n",
                 __func__, moe_mlock_ok_bytes / (1024.0 * 1024.0));
@@ -826,7 +838,11 @@ bool llama_context::load_expert_stats(const char * path) {
 
 void llama_context::apply_moe_hot_budget() {
     const auto & hparams = model.hparams;
-    if (!moe_auto_mode || moe_hot_budget_bytes == 0 || moe_hot_per_layer.empty()) {
+    size_t budget_bytes = moe_hot_budget_bytes;
+    if (moe_hot_budget_backoff_bytes > 0 && (budget_bytes == 0 || moe_hot_budget_backoff_bytes < budget_bytes)) {
+        budget_bytes = moe_hot_budget_backoff_bytes;
+    }
+    if (!moe_auto_mode || budget_bytes == 0 || moe_hot_per_layer.empty()) {
         return;
     }
 
@@ -860,7 +876,7 @@ void llama_context::apply_moe_hot_budget() {
         desired_bytes += expert_bytes[il] * (size_t) moe_hot_per_layer[il];
     }
 
-    if (desired_bytes <= moe_hot_budget_bytes) {
+    if (desired_bytes <= budget_bytes) {
         return;
     }
 
@@ -873,14 +889,14 @@ void llama_context::apply_moe_hot_budget() {
         minimum_bytes += expert_bytes[il] * (size_t) std::min(HOT_MIN, moe_hot_per_layer[il]);
     }
 
-    if (minimum_bytes <= moe_hot_budget_bytes) {
+    if (minimum_bytes <= budget_bytes) {
         for (size_t il = 0; il < moe_hot_per_layer.size(); ++il) {
             allocated[il] = std::min(HOT_MIN, moe_hot_per_layer[il]);
             used_bytes += expert_bytes[il] * (size_t) allocated[il];
         }
     } else {
         LLAMA_LOG_WARN("%s: MoE hot budget %.1f MiB is below the four-experts-per-layer minimum %.1f MiB\n",
-                __func__, moe_hot_budget_bytes / (1024.0 * 1024.0), minimum_bytes / (1024.0 * 1024.0));
+                __func__, budget_bytes / (1024.0 * 1024.0), minimum_bytes / (1024.0 * 1024.0));
     }
 
     std::vector<candidate> candidates;
@@ -902,7 +918,7 @@ void llama_context::apply_moe_hot_budget() {
     });
 
     for (const candidate & item : candidates) {
-        if (item.rank != allocated[item.il] || item.bytes == 0 || item.bytes > moe_hot_budget_bytes - used_bytes) {
+        if (item.rank != allocated[item.il] || item.bytes == 0 || item.bytes > budget_bytes - used_bytes) {
             continue;
         }
         ++allocated[item.il];
@@ -912,7 +928,7 @@ void llama_context::apply_moe_hot_budget() {
     moe_hot_per_layer = std::move(allocated);
     LLAMA_LOG_INFO("%s: MoE hot budget selected %.1f MiB of %.1f MiB, requested %.1f MiB\n",
             __func__, used_bytes / (1024.0 * 1024.0), desired_bytes / (1024.0 * 1024.0),
-            moe_hot_budget_bytes / (1024.0 * 1024.0));
+            budget_bytes / (1024.0 * 1024.0));
 }
 
 void llama_context::update_moe_hot_auto() {
