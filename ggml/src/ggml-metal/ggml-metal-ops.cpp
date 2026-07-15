@@ -3804,7 +3804,42 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // half4x4 kernel
         const int nqptg = OP_FLASH_ATTN_EXT_VEC_NQPSG; // queries per threadgroup
         const int ncpsg = OP_FLASH_ATTN_EXT_VEC_NCPSG; // cache values per simdgroup !! sync with kernel template arguments !!
-        const int nhptg = 1;                           // heads per threadgroup
+
+        // GQA folding: process all heads of a KV group in one threadgroup, reusing the K/V loads
+        // across the heads. requires the _nq8 kernel variants (dk = dv in {64, 96, 128}) and a
+        // mask that is shared between the heads
+        int nhptg = 1; // heads per threadgroup
+        {
+            const int32_t gqa = ne02/ne12;
+
+            if (gqa > 1 && ne02%ne12 == 0 &&
+                ne00 == ne20 && (ne00 == 64 || ne00 == 96 || ne00 == 128) &&
+                ne32 == 1 && ne33 == 1) {
+                switch (op->src[1]->type) {
+                    case GGML_TYPE_F16:
+                    case GGML_TYPE_BF16:
+                    case GGML_TYPE_Q4_0:
+                    case GGML_TYPE_Q8_0:
+                        // fold a small number of heads: enough to cut the redundant K/V traffic,
+                        // few enough to keep the threadgroup count (occupancy) high.
+                        // measured on M3 Ultra: nq=2 is the sweet spot, higher values serialize
+                        // the per-head dot products and lose more than the saved bandwidth
+                        {
+                            int32_t nq = 2;
+                            if (const char * env = getenv("GGML_METAL_FA_VEC_NQ")) {
+                                nq = atoi(env);
+                            }
+                            while (nq > 1 && gqa%nq != 0) {
+                                --nq;
+                            }
+                            nhptg = std::max(1, nq);
+                        }
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
 
         GGML_ASSERT(nqptg <= 32);
         GGML_ASSERT(nqptg  % 1  == 0);
@@ -3866,7 +3901,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // ne20*(nsg)
         // each simdgroup has a full f32 head vector in shared mem to accumulate results
         //
-#define FATTN_SMEM(nsg) (GGML_PAD(((GGML_PAD(ne00, 128) + 4*ncpsg + 2*GGML_PAD(ne20, 128))*(nsg))*(sizeof(float)/2), 16))
+#define FATTN_SMEM(nsg) (GGML_PAD(((GGML_PAD(ne00, 128) + (4*ncpsg + 2*GGML_PAD(ne20, 128))*(nsg))*nhptg)*(sizeof(float)/2), 16))
 
         int64_t nsg = 1;
 
@@ -3885,6 +3920,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                 nsg *= 2;
             }
         }
+
 
         ggml_metal_kargs_flash_attn_ext_vec args = {
             /*.ne01          =*/ ne01,
@@ -3921,7 +3957,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.logit_softcap =*/ logit_softcap,
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, nwg);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, nwg, nhptg);
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
