@@ -570,6 +570,7 @@ struct common_params {
     int32_t moe_hot_count  = 0;     // MoE experts to keep locked in RAM, -1 = auto from stats
     size_t moe_hot_budget_mib = 0;  // maximum locked MoE expert memory in auto mode, 0 = unlimited
     std::vector<int32_t> moe_hot_per_layer; // optional per-layer hot expert counts
+    bool moe_reclassify_force = false;      // force MoE reclassification for spec decode contexts
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading

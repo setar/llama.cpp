@@ -2614,6 +2614,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 
+    // speculative decoding uses multi-token decode batches (e.g. block_size=5)
+    // on the draft model context; force MoE reclassification even when the batch
+    // has more than 1 token so expert activation stats accumulate properly
+    result.moe_reclassify_force = has_draft;
+
     return result;
 }
 

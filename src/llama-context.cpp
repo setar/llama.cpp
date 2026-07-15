@@ -183,7 +183,8 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
-    cparams.moe_hot_count     = 0;
+    cparams.moe_hot_count          = 0;
+    cparams.moe_reclassify_force   = params.moe_reclassify_force;
 
     cparams.ctx_other = nullptr;
 
@@ -749,8 +750,16 @@ void llama_context::collect_moe_stats(const llm_graph_result * res, const llama_
     // first decode token consumes the whole prompt remainder as one update.
     // 256 caused an mlock churn over the ~88 GiB hot set every ~10 s of decode;
     // expert usage statistics drift far slower than that
+    //
+    // For speculative decoding contexts (moe_reclassify_force=true), the draft
+    // model always processes batches with block_size tokens (e.g. 5), so the
+    // n_tokens > 1 guard would permanently block reclassification. Allow it
+    // through for small multi-token decode batches.
     constexpr int64_t MOE_RECLASSIFY_INTERVAL_DECODE = 1024;
-    if (ubatch.n_tokens > 1 || moe_token_counter < MOE_RECLASSIFY_INTERVAL_DECODE) {
+    if (!cparams.moe_reclassify_force && ubatch.n_tokens > 1) {
+        return;
+    }
+    if (moe_token_counter < MOE_RECLASSIFY_INTERVAL_DECODE) {
         return;
     }
 
@@ -4029,6 +4038,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_hot_budget_mib          =*/ 0,
         /*.moe_hot_per_layer           =*/ nullptr,
         /*.n_moe_hot_per_layer         =*/ 0,
+        /*.moe_reclassify_force        =*/ false,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

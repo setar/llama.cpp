@@ -54,6 +54,7 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
     int32_t moe_hot_count;
+    bool    moe_reclassify_force = false;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

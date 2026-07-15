@@ -385,6 +385,7 @@ extern "C" {
         size_t   moe_hot_budget_mib;       // maximum locked MoE expert memory in auto mode, 0 = unlimited
         const int32_t * moe_hot_per_layer; // optional per-layer hot expert counts
         size_t   n_moe_hot_per_layer;
+        bool     moe_reclassify_force;     // force MoE reclassification even for multi-token decode batches (spec decoding)
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
