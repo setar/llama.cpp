@@ -2607,6 +2607,12 @@ common_params common_base_params_to_speculative(const common_params & params) {
             result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
             result.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
         }
+
+        // skip mlock for the draft model: the ~12 GB buffer cannot be mlocked
+        // in one shot after the target model has consumed most of the wired memory
+        // limit. The draft is small enough to stay resident in free RAM (~55 GB
+        // available) without explicit mlock.
+        result.use_mlock = false;
     }
 
     result.cache_type_k  = params_spec.cache_type_k;
