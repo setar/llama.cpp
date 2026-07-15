@@ -3014,4 +3014,36 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
     }
 
     return (uint32_t) nelements;
+int64_t llama_model_tensor_data_f32(const struct llama_model * model, const char * name, float * dst, int64_t n_max) {
+    ggml_tensor * t = nullptr;
+    for (const auto & it : model->tensors_by_name) {
+        if (it.first == name) {
+            t = it.second;
+            break;
+        }
+    }
+    if (t == nullptr) {
+        return -1;
+    }
+
+    const int64_t n = ggml_nelements(t);
+    if (n > n_max) {
+        return -1;
+    }
+
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(t, dst, 0, n*sizeof(float));
+        return n;
+    }
+
+    const auto * traits = ggml_get_type_traits(t->type);
+    if (traits->to_float == nullptr) {
+        return -1;
+    }
+
+    std::vector<uint8_t> staging(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, staging.data(), 0, staging.size());
+    traits->to_float(staging.data(), dst, n);
+
+    return n;
 }

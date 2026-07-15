@@ -130,3 +130,6 @@ LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_mode
 // if out is nullptr, returns the number of tokens without writing to out
 // caller must allocate enough memory for out before calling
 LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);
+// copy a named model tensor into dst converted to f32
+// returns the number of elements copied, or -1 if the tensor is missing or larger than n_max
+LLAMA_API int64_t llama_model_tensor_data_f32(const struct llama_model * model, const char * name, float * dst, int64_t n_max);
