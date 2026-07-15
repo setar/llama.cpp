@@ -18,6 +18,10 @@
 #include <map>
 #include <cinttypes>
 
+#if defined(__APPLE__)
+#  include <Accelerate/Accelerate.h>
+#endif
+
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_INF(fmt, ...) LOG_INF("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1536,8 +1540,16 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
 
                 const float * logits = llama_get_logits_ith(ctx_dft, beg + i);
 
-                // TODO: this matvec is ~n_vocab*markov_rank MACs per mini-step; move to
-                //       the backend if it shows up in profiles
+                // markov bias: bias_buf = markov_head @ e_prev
+#if defined(__APPLE__)
+                cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                    n_vocab, markov_rank,  // M = vocab, N = rank (A is [M, N])
+                    1.0f,                  // alpha
+                    markov_head.data(), markov_rank,  // A, lda
+                    e_prev, 1,             // x, incx
+                    0.0f,                  // beta
+                    bias_buf.data(), 1);   // y, incy
+#else
                 for (int32_t v = 0; v < n_vocab; ++v) {
                     const float * w = markov_head.data() + (size_t) v * markov_rank;
                     float b = 0.0f;
@@ -1546,6 +1558,7 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                     }
                     bias_buf[v] = b;
                 }
+#endif
 
                 // greedy draft (v1 targets temp=0 verification)
                 int32_t best = 0;

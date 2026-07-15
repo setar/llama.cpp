@@ -2870,6 +2870,7 @@ bool llama_model_has_encoder(const llama_model * model) {
         case LLM_ARCH_T5ENCODER:
         case LLM_ARCH_EAGLE3:
         case LLM_ARCH_DFLASH:    return true;
+        case LLM_ARCH_DEEPSEEK4_DSPARK: return true;
         default:                 return false;
     }
 }
@@ -3046,4 +3047,13 @@ int64_t llama_model_tensor_data_f32(const struct llama_model * model, const char
     traits->to_float(staging.data(), dst, n);
 
     return n;
+}
+
+struct ggml_tensor * llama_model_get_tensor(const struct llama_model * model, const char * name) {
+    for (const auto & it : model->tensors_by_name) {
+        if (it.first == name) {
+            return it.second;
+        }
+    }
+    return nullptr;
 }

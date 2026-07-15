@@ -133,3 +133,8 @@ LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, fl
 // copy a named model tensor into dst converted to f32
 // returns the number of elements copied, or -1 if the tensor is missing or larger than n_max
 LLAMA_API int64_t llama_model_tensor_data_f32(const struct llama_model * model, const char * name, float * dst, int64_t n_max);
+
+// get a named model tensor by name (returns the raw ggml_tensor pointer)
+// the tensor may live on any backend (CPU, Metal, CUDA, etc.)
+// returns nullptr if the tensor is not found
+LLAMA_API struct ggml_tensor * llama_model_get_tensor(const struct llama_model * model, const char * name);
