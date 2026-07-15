@@ -1388,6 +1388,16 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         ggml_tensor * h_nextn = cparams.embeddings_nextn_masked ? flat_out : inpL;
         cb(h_nextn, "h_nextn", -1);
         res->t_h_nextn = h_nextn;
+        cb(inpL, "l_out", il);
+
+        // DSpark main_hidden export: mean of the layer output over the hc axis
+        // (h.mean(dim=2) in the reference), dense for every token in the ubatch
+        if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+            ggml_tensor * mean_w = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc, n_tokens);
+            mean_w = ggml_fill(ctx0, mean_w, 1.0f/hc);
+            res->t_layer_inp[il] = build_hc_weighted_sum(inpL, mean_w);
+            cb(res->t_layer_inp[il], "dspark_main_hidden", il);
+        }
     }
 
     if (inp_out_ids) {
