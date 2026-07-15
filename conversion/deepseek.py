@@ -584,8 +584,10 @@ class DeepseekV4Model(TextModel):
 
     def set_vocab(self):
         if DSV4_DSPARK_MODE:
-            # the draft module shares the tokenizer and embeddings with the main model
+            # the draft module shares the tokenizer with the main model, but the
+            # loader still needs the vocab size to shape embed/head tensors
             self._set_vocab_none()
+            self.gguf_writer.add_vocab_size(self.hparams["vocab_size"])
             return
         super().set_vocab()
 

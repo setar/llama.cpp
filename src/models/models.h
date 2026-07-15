@@ -1293,6 +1293,16 @@ struct llama_model_deepseek4 : public llama_model_base {
 };
 
 
+// DSpark speculative draft module: 3 raw-attention deepseek4 blocks + markov/confidence heads
+struct llama_model_deepseek4_dspark : public llama_model_deepseek4 {
+    llama_model_deepseek4_dspark(const struct llama_model_params & params) : llama_model_deepseek4(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
 struct llama_model_deepseek2ocr : public llama_model_base {
     llama_model_deepseek2ocr(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;

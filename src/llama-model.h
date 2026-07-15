@@ -606,6 +606,13 @@ struct llama_model {
     struct ggml_tensor * hc_head_base  = nullptr;
     struct ggml_tensor * hc_head_scale = nullptr;
 
+    // DSpark draft module (deepseek4-dspark)
+    struct ggml_tensor * dspark_main_proj   = nullptr;
+    struct ggml_tensor * dspark_main_norm   = nullptr;
+    struct ggml_tensor * dspark_markov_embd = nullptr;
+    struct ggml_tensor * dspark_markov_head = nullptr;
+    struct ggml_tensor * dspark_conf_head   = nullptr;
+
     // classifier
     struct ggml_tensor * cls       = nullptr;
     struct ggml_tensor * cls_b     = nullptr;

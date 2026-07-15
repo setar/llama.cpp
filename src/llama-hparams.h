@@ -249,6 +249,13 @@ struct llama_hparams {
     float    dsv4_hc_eps               = 0.0f;
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios;
 
+    // DSpark speculative module (deepseek4-dspark)
+    uint32_t dspark_block_size      = 0;
+    uint32_t dspark_noise_token_id  = 0;
+    uint32_t dspark_markov_rank     = 0;
+    uint32_t dspark_n_target_layers = 0;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> dspark_target_layers;
+
     // qwen3vl deepstack
     // When parsed from GGUF, this implies the first N layers consume the first
     // N deepstack embeddings. Use deepstack_mapping_arr if you need a more
