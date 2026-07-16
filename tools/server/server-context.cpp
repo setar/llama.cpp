@@ -3503,20 +3503,32 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
-                                    // search for a context checkpoint
-                                    const auto it = std::find_if(
+                                {
+                                    // search for a context checkpoint (unconditional — also runs on cold
+                                    // KV cache so the end-of-prompt checkpoint from the previous request
+                                    // can be restored even when LCP similarity doesn't match)
+                                    auto checkpoint_match = [&](const auto & cur) {
+                                        SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
+                                        return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                    };
+
+                                    auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
                                         slot.prompt.checkpoints.rend(),
-                                        [&](const auto & cur) {
-                                            // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
-                                            SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
-                                            // Allow checkpoint even if it covers more than pos_next (e.g. end-of-prompt
-                                            // checkpoint being restored for the next request). The checkpoint will be
-                                            // loaded and then only the new/different tokens need to be processed.
-                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
-                                        }
+                                        checkpoint_match
                                     );
+
+                                    // Fallback: if no position match but checkpoints exist (cold KV cache),
+                                    // pick the latest checkpoint (largest n_tokens) to restore from.
+                                    if (it == slot.prompt.checkpoints.rend() && !slot.prompt.checkpoints.empty()) {
+                                        SLT_TRC(slot, "%s", "no position match, trying latest checkpoint as fallback\n");
+                                        // Accept the first (newest) checkpoint in reverse iteration
+                                        it = std::find_if(
+                                            slot.prompt.checkpoints.rbegin(),
+                                            slot.prompt.checkpoints.rend(),
+                                            [](const auto &) { return true; }
+                                        );
+                                    }
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
