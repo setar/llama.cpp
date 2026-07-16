@@ -3616,29 +3616,79 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     common_peg_parse_context ctx(effective_input, flags);
     auto result = parser.parse(ctx);
 
-    if (result.fail()) {
+    if (result.fail() || (result.need_more_input() && !is_partial)) {
         // During partial parsing, return partial results if any AST nodes were captured
         // This allows streaming to work correctly for formats like FUNC_MARKDOWN_CODE_BLOCK
-        if (is_partial && result.end > 0) {
-            // Try to extract any partial results from what was successfully parsed
+        if (is_partial) {
+            if (result.end > 0) {
+                // Try to extract any partial results from what was successfully parsed
+                common_chat_msg msg;
+                msg.role = "assistant";
+                std::unique_ptr<common_chat_peg_mapper> mapper;
+                if (params.format == COMMON_CHAT_FORMAT_PEG_GEMMA4) {
+                    mapper = std::make_unique<common_chat_peg_gemma4_mapper>(msg);
+                } else {
+                    mapper = std::make_unique<common_chat_peg_mapper>(msg);
+                }
+                mapper->from_ast(ctx.ast, result);
+
+                if (ctx.is_debug()) {
+                    fprintf(stderr, "\nAST for partial parse (fail):\n%s\n", ctx.ast.dump().c_str());
+                    fflush(stderr);
+                }
+                return msg;
+            }
+
+            // result.end == 0: nothing was parsed yet (first streaming chunk too short).
+            // Return an empty msg so streaming continues without throwing 500.
+            LOG_DBG("%s: partial %s parse empty at end=0 (%zu bytes), skipping\n",
+                __func__, common_chat_format_name(params.format), ctx.input.size());
+            common_chat_msg empty_msg;
+            empty_msg.role = "assistant";
+            return empty_msg;
+        }
+
+        // Fallback for complete input that couldn't be parsed by PEG (e.g., model
+        // responded with text instead of a tool call). Extract reasoning and content
+        // directly from the raw model output via simple marker matching.
+        if (!is_partial) {
+            LOG_WRN("%s: %s parse fallback for complete input, end=%zu/%zu\n",
+                __func__, common_chat_format_name(params.format), result.end, ctx.input.size());
             common_chat_msg msg;
             msg.role = "assistant";
-            std::unique_ptr<common_chat_peg_mapper> mapper;
-            if (params.format == COMMON_CHAT_FORMAT_PEG_GEMMA4) {
-                mapper = std::make_unique<common_chat_peg_gemma4_mapper>(msg);
-            } else if (params.format == COMMON_CHAT_FORMAT_PEG_MINIMAX_M3) {
-                mapper = std::make_unique<common_chat_peg_minimax_m3_mapper>(msg);
-            } else {
-                mapper = std::make_unique<common_chat_peg_mapper>(msg);
+
+            // Try to extract <think>...</think> reasoning block.
+            // The generation_prompt ends with a leading <think> (not in model output),
+            // so search in effective_input (ctx.input) to find the markers.
+            static const std::string think_start = "<think>";
+            static const std::string think_end   = "</think>";
+            size_t ts = ctx.input.find(think_start);
+            size_t te = std::string::npos;
+            if (ts != std::string::npos) {
+                te = ctx.input.find(think_end, ts + think_start.size());
             }
-            mapper->from_ast(ctx.ast, result);
+            if (ts != std::string::npos && te != std::string::npos) {
+                // Extract reasoning from effective_input (between markers)
+                msg.reasoning_content = ctx.input.substr(ts + think_start.size(), te - ts - think_start.size());
+                // Content is everything after </think> in the raw model output
+                size_t content_start = te + think_end.size();
+                // Skip leading whitespace/newline
+                while (content_start < ctx.input.size() && (ctx.input[content_start] == '\n' || ctx.input[content_start] == ' ')) {
+                    content_start++;
+                }
+                msg.content = ctx.input.substr(content_start);
+            } else {
+                // No reasoning marker — whole model output is content
+                msg.content = input.empty() ? ctx.input : input;
+            }
 
             if (ctx.is_debug()) {
-                fprintf(stderr, "\nAST for partial parse (fail):\n%s\n", ctx.ast.dump().c_str());
-                fflush(stderr);
+                fprintf(stderr, "\nFallback parse result: reasoning=%zu, content=%zu\n",
+                    msg.reasoning_content.size(), msg.content.size());
             }
             return msg;
         }
+
         LOG_WRN("%s: unparsed %s output: %s\n", __func__, common_chat_format_name(params.format), effective_input.substr(result.end).c_str());
         LOG_DBG("%s: full %s output triggering error:\n=== BEGIN ===\n%s\n=== END ===\n", __func__, common_chat_format_name(params.format), effective_input.c_str());
         throw std::runtime_error(std::string("The model produced output that does not match the expected ") + common_chat_format_name(params.format) + " format");

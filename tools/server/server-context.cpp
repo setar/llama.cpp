@@ -2542,7 +2542,10 @@ private:
             std::filesystem::create_directories(std::filesystem::path(cur.filepath).parent_path(), ec);
             if (!ec && write_checkpoint_to_disk(cur.filepath, cur)) {
                 cur.size_disk = size_created;
-                clear_checkpoint_ram(cur);
+                // Keep checkpoint data in RAM even after disk write.
+                // If the disk file is later removed (e.g. by enforce_checkpoint_disk_limit),
+                // the checkpoint data is still available in RAM for restore.
+                //clear_checkpoint_ram(cur);
                 enforce_checkpoint_disk_limit();
             } else {
                 SLT_WRN(slot, "failed to write context checkpoint to disk: %s, keeping it in RAM\n", cur.filepath.c_str());
@@ -3508,10 +3511,9 @@ private:
                                         [&](const auto & cur) {
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
-                                            // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
-                                            if (cur.pos_max > pos_next) {
-                                                return false;
-                                            }
+                                            // Allow checkpoint even if it covers more than pos_next (e.g. end-of-prompt
+                                            // checkpoint being restored for the next request). The checkpoint will be
+                                            // loaded and then only the new/different tokens need to be processed.
                                             return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                                         }
                                     );
@@ -3538,6 +3540,13 @@ private:
 
                                         pos_next = std::min(pos_next, std::max(ckpt.pos_min + 1, ckpt.pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) ckpt.n_tokens);
+                                        // When restoring a full end-of-prompt checkpoint from a previous request,
+                                        // the checkpoint covers more tokens than the current n_past. Override to
+                                        // the checkpoint's full token count so we avoid reprocessing the prefix.
+                                        if (ckpt.n_tokens > (int64_t) n_past) {
+                                            n_past   = (int32_t) ckpt.n_tokens;
+                                            pos_next = n_past;
+                                        }
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", ckpt.pos_min, ckpt.pos_max, ckpt.n_tokens, n_past, (float) ckpt.size() / 1024 / 1024);
 
                                         if (!ckpt.filepath.empty()) {
@@ -3758,6 +3767,18 @@ private:
                         slot.i_batch   = batch.size() - 1;
 
                         slot.init_sampler();
+
+                        // Force checkpoint at the end of the prompt so the next request
+                        // can restore from here instead of reprocessing everything.
+                        if (params_base.n_ctx_checkpoints > 0) {
+                            const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                            const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                            if (pos_min >= 0) {
+                                // Use n_batch here as a rough proxy for n_tokens_cur
+                                const int64_t n_tokens_cur = batch.size();
+                                create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                            }
+                        }
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt

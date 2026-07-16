@@ -701,6 +701,10 @@ struct parser_executor {
             last_valid_pos = pos;
         }
 
+        if (p.delimiters.empty()) {
+            // rest() / until_one_of({}): no delimiters to wait for — consume everything.
+            return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_SUCCESS, start_pos, ctx.input.size());
+        }
         if (last_valid_pos == ctx.input.size() && ctx.is_lenient()) {
             // Reached the end of a partial stream, there might still be more input that we need to consume.
             return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_NEED_MORE_INPUT, start_pos, last_valid_pos);
