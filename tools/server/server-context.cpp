@@ -3519,15 +3519,23 @@ private:
                                     );
 
                                     // Fallback: if no position match but checkpoints exist (cold KV cache),
-                                    // pick the latest checkpoint (largest n_tokens) to restore from.
+                                    // pick the best checkpoint that fits within the current task (prefix match).
+                                    // Only accept checkpoints whose n_tokens <= task size — otherwise the
+                                    // checkpoint is from a different conversation and restoring it would
+                                    // corrupt the KV cache.
                                     if (it == slot.prompt.checkpoints.rend() && !slot.prompt.checkpoints.empty()) {
-                                        SLT_TRC(slot, "%s", "no position match, trying latest checkpoint as fallback\n");
-                                        // Accept the first (newest) checkpoint in reverse iteration
-                                        it = std::find_if(
-                                            slot.prompt.checkpoints.rbegin(),
-                                            slot.prompt.checkpoints.rend(),
-                                            [](const auto &) { return true; }
-                                        );
+                                        SLT_TRC(slot, "%s", "no position match, trying latest compatible checkpoint as fallback\n");
+                                        // Find the checkpoint with the most tokens that fits within the task
+                                        for (auto rit = slot.prompt.checkpoints.rbegin(); rit != slot.prompt.checkpoints.rend(); ++rit) {
+                                            if ((int64_t) rit->n_tokens <= slot.task->n_tokens()) {
+                                                it = rit;
+                                                break;
+                                            }
+                                        }
+                                        if (it != slot.prompt.checkpoints.rend()) {
+                                            SLT_TRC(slot, "fallback: selected checkpoint n_tokens=%" PRId64 " for task with %d tokens\n",
+                                                    it->n_tokens, slot.task->n_tokens());
+                                        }
                                     }
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
