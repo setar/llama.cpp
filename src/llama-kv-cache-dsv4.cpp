@@ -251,12 +251,19 @@ static void dsv4_state_write_tensor_streams(
         ggml_tensor      * tensor,
         uint32_t           tensor_rows,
         uint32_t           n_rows,
+        uint32_t           n_rows_used,
         uint32_t           s0,
         uint32_t           ns,
         const std::vector<uint32_t> * stream_ids = nullptr) {
+        uint32_t           ns) {
+    // n_rows is the per-stream stride in the tensor; only the first n_rows_used
+    // rows of each stream are serialized (the rest were never committed for the
+    // sequence being saved and are masked from attention until overwritten)
+    GGML_ASSERT(n_rows_used <= n_rows);
+
     const int32_t  type_i   = (int32_t) tensor->type;
     const uint64_t ne0      = tensor->ne[0];
-    const uint64_t rows     = n_rows;
+    const uint64_t rows     = n_rows_used;
     const uint64_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
 
     if (n_rows > tensor_rows) {
@@ -284,6 +291,10 @@ static void dsv4_state_write_tensor_streams(
             throw std::runtime_error("DSV4 state tensor stream out of range");
         }
         const size_t offset = (size_t) stream*stream_stride;
+    for (uint32_t s = s0; s < s0 + ns; ++s) {
+        const size_t offset = (size_t) s*n_rows*row_size;
+        const size_t size   = (size_t) n_rows_used*row_size;
+
         io.write_tensor(tensor, offset, size);
     }
 }
@@ -307,10 +318,9 @@ static void dsv4_state_read_tensor_streams(
 
     const int32_t  type_i   = (int32_t) tensor->type;
     const uint64_t ne0      = tensor->ne[0];
-    const uint64_t rows     = n_rows;
     const uint64_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
 
-    if (type_i != type_i_ref || ne0 != ne0_ref || rows != rows_ref || row_size != row_size_ref) {
+    if (type_i != type_i_ref || ne0 != ne0_ref || rows_ref > n_rows || row_size != row_size_ref) {
         throw std::runtime_error("DSV4 state tensor metadata mismatch");
     }
     if (n_rows > tensor_rows) {
@@ -325,6 +335,10 @@ static void dsv4_state_read_tensor_streams(
 
     for (uint32_t s = 0; s < ns; ++s) {
         const size_t offset = (size_t) (s0 + s)*stream_stride;
+    for (uint32_t s = s0; s < s0 + ns; ++s) {
+        const size_t offset = (size_t) s*n_rows*row_size;
+        const size_t size   = (size_t) rows_ref*row_size;
+
         io.read_tensor(tensor, offset, size);
     }
 }
@@ -335,6 +349,7 @@ static void dsv4_state_write_k_cache(
         llama_seq_id          seq_id,
         llama_state_seq_flags flags,
         uint32_t              n_rows) {
+        uint32_t              n_rows_used) {
     GGML_UNUSED(flags);
 
     uint32_t s0;
@@ -349,6 +364,7 @@ static void dsv4_state_write_k_cache(
     if (n_rows > kv_size) {
         throw std::runtime_error("DSV4 K-cache state row count exceeds cache size");
     }
+    n_rows_used = std::min(n_rows_used, kv_size);
 
     io.write(&version, sizeof(version));
     io.write(&n_rows,  sizeof(n_rows));
@@ -358,6 +374,7 @@ static void dsv4_state_write_k_cache(
     for (uint32_t il : layer_ids) {
         io.write(&il, sizeof(il));
         dsv4_state_write_tensor_streams(io, kv->get_k_storage(il), kv_size, n_rows, s0, ns);
+        dsv4_state_write_tensor_streams(io, kv->get_k_storage(il), kv_size, n_rows_used, s0, ns);
     }
 }
 
@@ -1060,6 +1077,8 @@ void llama_dsv4_comp_state::state_write(
 
         dsv4_state_write_tensor_streams(io, layer.kv,    state_size, state_size, s0, ns, &stream_ids);
         dsv4_state_write_tensor_streams(io, layer.score, state_size, state_size, s0, ns, &stream_ids);
+        dsv4_state_write_tensor_streams(io, layer.kv,    state_size, state_size, s0, ns);
+        dsv4_state_write_tensor_streams(io, layer.score, state_size, state_size, s0, ns);
     }
 }
 
@@ -1559,6 +1578,30 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
         dsv4_state_write_k_cache(io, kv_csa.get(), seq_id, flags, n_rows_csa);
         dsv4_state_write_k_cache(io, kv_hca.get(), seq_id, flags, n_rows_hca);
         dsv4_state_write_k_cache(io, kv_lid.get(), seq_id, flags, n_rows_lid);
+        // compressed rows are committed at deterministic ids pos/ratio, so only
+        // rows [0, n_tokens/ratio] can hold data for the sequence — serializing
+        // the full allocation would scale with n_ctx instead of the prompt size
+        llama_pos pos_max = -1;
+        if (seq_id >= 0) {
+            pos_max = kv_raw->seq_pos_max(seq_id);
+        } else {
+            for (uint32_t s = 0; s < n_seq_max; ++s) {
+                pos_max = std::max(pos_max, kv_raw->seq_pos_max((llama_seq_id) s));
+            }
+        }
+
+        // +1 row of margin over the completed-block count for boundary rounding;
+        // the masked scratch row at kv_size-1 is intentionally excluded — it is
+        // rewritten from the compressor state on every partial-block step before
+        // attention can see it
+        const uint32_t n_tokens = (uint32_t) (pos_max + 1);
+
+        const uint32_t n_rows_csa = n_tokens == 0 ? 0 : n_tokens/DSV4_CSA_RATIO + 1;
+        const uint32_t n_rows_hca = n_tokens == 0 ? 0 : n_tokens/DSV4_HCA_RATIO + 1;
+
+        dsv4_state_write_k_cache(io, kv_csa.get(), seq_id, flags, n_rows_csa);
+        dsv4_state_write_k_cache(io, kv_hca.get(), seq_id, flags, n_rows_hca);
+        dsv4_state_write_k_cache(io, kv_lid.get(), seq_id, flags, n_rows_csa);
     }
 
     csa_state->state_write(io, seq_id, flags, rs_idx);
