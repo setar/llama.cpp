@@ -13,9 +13,12 @@
 
 #include <algorithm>
 #include <cassert>
+#include <condition_variable>
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <mutex>
+#include <thread>
 #include <cinttypes>
 
 #if defined(__APPLE__)
@@ -1273,6 +1276,22 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
     std::vector<float> features_buf; // [n_tokens, n_embd_enc]
     std::vector<float> bias_buf;     // [n_vocab] markov logit bias
 
+    // async inject pipeline: background thread runs encode+inject while
+    // the main model processes the next prefill ubatch
+    struct InjectWork {
+        std::vector<float>     features;   // [n_rows, n_embd_enc]
+        std::vector<llama_pos> positions;  // [n_rows]
+        llama_seq_id           seq_id = -1;
+    };
+    std::mutex              proc_mtx;
+    std::condition_variable proc_cv;
+    bool                    proc_idle  = true;  // background thread has no pending work
+    bool                    proc_stop  = false;
+    bool                    proc_ok    = true;  // false on encode/inject error
+    InjectWork              proc_work;
+    bool                    proc_work_ready = false;
+    std::thread             proc_thread;
+
     common_speculative_impl_draft_dspark(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, n_seq)
         , params(params.draft)
@@ -1332,6 +1351,9 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
         batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
         batch_inject = llama_batch_init(llama_n_batch(ctx_dft), n_embd_dec, n_seq);
 
+        // start the async inject worker thread
+        proc_thread = std::thread(&common_speculative_impl_draft_dspark::proc_worker, this);
+
         // extraction of the target layers' hc-collapsed outputs (dspark main_hidden)
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
@@ -1342,8 +1364,92 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_dspark() override {
+        {
+            std::lock_guard<std::mutex> lk(proc_mtx);
+            proc_stop = true;
+        }
+        proc_cv.notify_all();
+        if (proc_thread.joinable()) {
+            proc_thread.join();
+        }
         llama_batch_free(batch);
         llama_batch_free(batch_inject);
+    }
+
+    // background worker: runs encode+inject for one InjectWork item at a time
+    void proc_worker() {
+        auto * ctx_dft         = this->params.ctx_dft;
+        llama_memory_t mem_dft = llama_get_memory(ctx_dft);
+        const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+
+        while (true) {
+            InjectWork work;
+            {
+                std::unique_lock<std::mutex> lk(proc_mtx);
+                proc_cv.wait(lk, [this] { return proc_work_ready || proc_stop; });
+                if (proc_stop && !proc_work_ready) {
+                    break;
+                }
+                work = std::move(proc_work);
+                proc_work_ready = false;
+            }
+
+            const int32_t n_rows = (int32_t) work.positions.size();
+
+            // drop stale inject rows at (and beyond) the first injected position
+            llama_memory_seq_rm(mem_dft, work.seq_id, work.positions[0], -1);
+
+            bool ok = true;
+            for (int32_t offset = 0; offset < n_rows && ok; offset += n_ubatch) {
+                const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+
+                llama_batch enc_batch = {
+                    /*.n_tokens =*/ n_chunk,
+                    /*.token    =*/ nullptr,
+                    /*.embd     =*/ work.features.data() + (size_t) offset * n_embd_enc,
+                    /*.pos      =*/ nullptr,
+                    /*.n_seq_id =*/ nullptr,
+                    /*.seq_id   =*/ nullptr,
+                    /*.logits   =*/ nullptr,
+                };
+                int32_t rc = llama_encode(ctx_dft, enc_batch);
+                if (rc != 0) {
+                    LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (offset=%d)\n", __func__, rc, (int) offset);
+                    ok = false;
+                    break;
+                }
+
+                const float * main_x = llama_get_embeddings_nextn(ctx_dft);
+                GGML_ASSERT(main_x && "DSpark encoder produced no output.");
+
+                batch_inject.n_tokens = n_chunk;
+                std::memcpy(batch_inject.embd, main_x, (size_t) n_chunk * n_embd_dec * sizeof(float));
+                for (int32_t i = 0; i < n_chunk; ++i) {
+                    batch_inject.pos[i]       = work.positions[offset + i];
+                    batch_inject.n_seq_id[i]  = 1;
+                    batch_inject.seq_id[i][0] = work.seq_id;
+                    batch_inject.logits[i]    = false;
+                }
+                rc = llama_decode(ctx_dft, batch_inject);
+                if (rc != 0) {
+                    LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (offset=%d)\n", __func__, rc, (int) offset);
+                    ok = false;
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(proc_mtx);
+                proc_idle = true;
+                if (!ok) { proc_ok = false; }
+            }
+            proc_cv.notify_all();
+        }
+    }
+
+    // wait until background inject has finished (call before draft() or begin())
+    void flush_inject() {
+        std::unique_lock<std::mutex> lk(proc_mtx);
+        proc_cv.wait(lk, [this] { return proc_idle; });
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1356,6 +1462,9 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             return;
         }
 
+        // ensure all pending async inject work is complete before we check pos_max
+        flush_inject();
+
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
         if (pos_max < N - 1) {
             LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d - process() did not run on every prefill ubatch. "
@@ -1364,8 +1473,9 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
         }
     }
 
-    // every verified target batch: fuse the extracted main_hidden rows through the
-    // encoder (main_proj+main_norm) and inject wkv(main_x) rows into the draft cache
+    // every verified target batch: gather main_hidden features and submit async encode+inject.
+    // the actual encode+inject runs on the background thread (proc_worker) while the main
+    // model is decoding the next ubatch, overlapping DSpark GPU work with the main forward pass.
     bool process(const llama_batch & batch_in) override {
         if (batch_in.n_tokens <= 0) {
             return true;
@@ -1381,22 +1491,17 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
         std::vector<int32_t> i_batch_end(n_seq, -1);
         for (int32_t k = 0; k < n_tokens; ++k) {
             GGML_ASSERT(batch_in.n_seq_id[k] == 1);
-            const llama_seq_id seq_id = batch_in.seq_id[k][0];
-            if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            const llama_seq_id sid = batch_in.seq_id[k][0];
+            if (sid < 0 || sid >= (llama_seq_id) n_seq) {
                 continue;
             }
-            i_batch_end[seq_id] = k;
-            if (i_batch_beg[seq_id] < 0) {
-                i_batch_beg[seq_id] = k;
+            i_batch_end[sid] = k;
+            if (i_batch_beg[sid] < 0) {
+                i_batch_beg[sid] = k;
             }
         }
 
         auto * ctx_tgt = this->params.ctx_tgt;
-        auto * ctx_dft = this->params.ctx_dft;
-
-        llama_memory_t mem_dft = llama_get_memory(ctx_dft);
-
-        const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
@@ -1404,69 +1509,52 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
 
-            // drop stale draft-block rows at (and beyond) the injected positions
-            llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
+            // wait for the previous async inject to finish before preparing a new one:
+            // ensures no two InjectWork items race on ctx_dft or the same seq KV rows
+            {
+                std::unique_lock<std::mutex> lk(proc_mtx);
+                proc_cv.wait(lk, [this] { return proc_idle; });
+                if (!proc_ok) { return false; }
+            }
 
-            for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
-                const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+            // gather hidden states from target layers into InjectWork (CPU copy, fast)
+            InjectWork work;
+            work.seq_id = seq_id;
+            work.features.resize((size_t) n_rows * n_embd_enc);
+            work.positions.resize(n_rows);
 
-                features_buf.resize((size_t) n_chunk * n_embd_enc);
-                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
-                    if (!layer) {
-                        GGML_ABORT("DSpark: target layer %d output not extracted.", target_layer_ids[k]);
-                    }
-                    for (int32_t i = 0; i < n_chunk; ++i) {
-                        float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
-                        std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
-                    }
+            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                if (!layer) {
+                    GGML_ABORT("DSpark: target layer %d output not extracted.", target_layer_ids[k]);
                 }
-
-                // main_x = main_norm(main_proj(main_hidden))
-                llama_batch enc_batch = {
-                    /*.n_tokens =*/ n_chunk,
-                    /*.token    =*/ nullptr,
-                    /*.embd     =*/ features_buf.data(),
-                    /*.pos      =*/ nullptr,
-                    /*.n_seq_id =*/ nullptr,
-                    /*.seq_id   =*/ nullptr,
-                    /*.logits   =*/ nullptr,
-                };
-
-                int32_t rc = llama_encode(ctx_dft, enc_batch);
-                if (rc != 0) {
-                    LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
-                    return false;
-                }
-
-                const float * main_x = llama_get_embeddings_nextn(ctx_dft);
-                GGML_ASSERT(main_x && "DSpark encoder produced no output.");
-
-                // cache-fill: one wkv matmul per block at the rows' absolute positions
-                batch_inject.n_tokens = n_chunk;
-                std::memcpy(batch_inject.embd, main_x, (size_t) n_chunk * n_embd_dec * sizeof(float));
-
-                for (int32_t i = 0; i < n_chunk; ++i) {
-                    batch_inject.pos[i]       = batch_in.pos[i_batch_beg[seq_id] + offset + i];
-                    batch_inject.n_seq_id[i]  = 1;
-                    batch_inject.seq_id[i][0] = seq_id;
-                    batch_inject.logits[i]    = false;
-                }
-                rc = llama_decode(ctx_dft, batch_inject);
-                if (rc != 0) {
-                    LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
-                    return false;
+                for (int32_t i = 0; i < n_rows; ++i) {
+                    float       * dst = work.features.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                    const float * src = layer + (size_t) (i_batch_beg[seq_id] + i) * n_embd_tgt;
+                    std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                 }
             }
+            for (int32_t i = 0; i < n_rows; ++i) {
+                work.positions[i] = batch_in.pos[i_batch_beg[seq_id] + i];
+            }
+
+            // hand off to background thread; encode+inject overlaps with next main decode
+            {
+                std::lock_guard<std::mutex> lk(proc_mtx);
+                proc_work       = std::move(work);
+                proc_work_ready = true;
+                proc_idle       = false;
+            }
+            proc_cv.notify_one();
         }
 
-        return true;
+        return proc_ok;
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        // ensure all async inject work is complete before generating draft tokens
+        flush_inject();
+
         auto & ctx_dft = params.ctx_dft;
 
         common_batch_clear(batch);
