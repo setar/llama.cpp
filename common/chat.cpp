@@ -3682,9 +3682,94 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
                 msg.content = input.empty() ? ctx.input : input;
             }
 
+            // Extract DSML tool calls if present in content.
+            // Handles cases where PEG parse failed (e.g. unknown tool, schema mismatch,
+            // parallel invocations) but model produced a valid DSML block.
+            {
+                const std::string FC_START = "<｜DSML｜function_calls>";
+                const std::string INV_S    = "<｜DSML｜invoke";
+                const std::string INV_E    = "</｜DSML｜invoke>";
+                const std::string PRM_S    = "<｜DSML｜parameter";
+                const std::string PRM_E    = "</｜DSML｜parameter>";
+
+                size_t fc_pos = msg.content.find(FC_START);
+                if (fc_pos != std::string::npos) {
+                    // Truncate visible content before the DSML block
+                    std::string raw_fc = msg.content.substr(fc_pos);
+                    msg.content = msg.content.substr(0, fc_pos);
+                    while (!msg.content.empty() && (msg.content.back() == '\n' || msg.content.back() == ' ')) {
+                        msg.content.pop_back();
+                    }
+
+                    // Parse each <invoke> in the block
+                    size_t pos = 0;
+                    while ((pos = raw_fc.find(INV_S, pos)) != std::string::npos) {
+                        // name="ToolName"
+                        size_t nq1 = raw_fc.find('"', pos + INV_S.size());
+                        if (nq1 == std::string::npos) break;
+                        size_t nq2 = raw_fc.find('"', nq1 + 1);
+                        if (nq2 == std::string::npos) break;
+                        std::string tool_name = raw_fc.substr(nq1 + 1, nq2 - nq1 - 1);
+
+                        // Body of this invoke up to </invoke>
+                        size_t inv_end = raw_fc.find(INV_E, nq2);
+                        if (inv_end == std::string::npos) break;
+                        std::string body = raw_fc.substr(nq2 + 1, inv_end - nq2 - 1);
+
+                        // Parse <parameter name="..." string="true/false">value</parameter>
+                        json args = json::object();
+                        size_t ppos = 0;
+                        while ((ppos = body.find(PRM_S, ppos)) != std::string::npos) {
+                            size_t pn1 = body.find('"', ppos + PRM_S.size());
+                            if (pn1 == std::string::npos) break;
+                            size_t pn2 = body.find('"', pn1 + 1);
+                            if (pn2 == std::string::npos) break;
+                            std::string param_name = body.substr(pn1 + 1, pn2 - pn1 - 1);
+
+                            // Detect string="true/false" attribute
+                            bool is_string = true;
+                            size_t close_gt = body.find('>', pn2);
+                            size_t str_attr = body.find("string=\"", pn2);
+                            if (str_attr != std::string::npos && (close_gt == std::string::npos || str_attr < close_gt)) {
+                                size_t sv1 = str_attr + 8; // len("string=\"")
+                                size_t sv2 = body.find('"', sv1);
+                                if (sv2 != std::string::npos) {
+                                    is_string = body.substr(sv1, sv2 - sv1) == "true";
+                                    close_gt = body.find('>', sv2);
+                                }
+                            }
+
+                            if (close_gt == std::string::npos) break;
+                            size_t val_s = close_gt + 1;
+                            size_t val_e = body.find(PRM_E, val_s);
+                            if (val_e == std::string::npos) break;
+                            std::string value = body.substr(val_s, val_e - val_s);
+
+                            if (is_string) {
+                                args[param_name] = value;
+                            } else {
+                                try {
+                                    args[param_name] = json::parse(value);
+                                } catch (...) {
+                                    args[param_name] = value;
+                                }
+                            }
+                            ppos = val_e + PRM_E.size();
+                        }
+
+                        common_chat_tool_call tc;
+                        tc.name      = tool_name;
+                        tc.arguments = args.dump();
+                        msg.tool_calls.push_back(tc);
+
+                        pos = inv_end + INV_E.size();
+                    }
+                }
+            }
+
             if (ctx.is_debug()) {
-                fprintf(stderr, "\nFallback parse result: reasoning=%zu, content=%zu\n",
-                    msg.reasoning_content.size(), msg.content.size());
+                fprintf(stderr, "\nFallback parse result: reasoning=%zu, content=%zu, tool_calls=%zu\n",
+                    msg.reasoning_content.size(), msg.content.size(), msg.tool_calls.size());
             }
             return msg;
         }
