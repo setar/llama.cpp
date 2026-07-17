@@ -3682,11 +3682,17 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
                 }
                 msg.content = ctx.input.substr(content_start);
             } else {
-                // No <think> found — it may have been injected via generation_prompt
-                // (harness prefill) and is absent from effective_input. If there is an
-                // orphaned </think>, split on it: everything before is reasoning tail,
-                // everything after is content.
-                size_t te_only = ctx.input.find(think_end);
+                // No <think> opening found.
+                // When generation_prompt is empty (recap/prefill context), <think> was
+                // injected in the prompt body and is absent from effective_input.
+                // In that case look for an orphaned </think> and split on it so the
+                // closing tag does not leak into visible content.
+                // Guard: only apply when generation_prompt is actually empty —
+                // for normal requests generation_prompt always contains <think> so
+                // ts would have been found, and we would not be in this branch.
+                size_t te_only = params.generation_prompt.empty()
+                                 ? ctx.input.find(think_end)
+                                 : std::string::npos;
                 if (te_only != std::string::npos) {
                     msg.reasoning_content = ctx.input.substr(0, te_only);
                     size_t content_start = te_only + think_end.size();
