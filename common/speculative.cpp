@@ -1471,8 +1471,12 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             return;
         }
 
-        // ensure all pending async inject work is complete before we check pos_max
+        // flush any pending async inject and reset error state for this new generation
         flush_inject();
+        {
+            std::lock_guard<std::mutex> lk(proc_mtx);
+            proc_ok = true;
+        }
 
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
         if (pos_max < N - 1) {
