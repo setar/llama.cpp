@@ -4118,6 +4118,9 @@ private:
                         ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                         if (slot.ctx_dft) {
+                            // flush async inject before modifying ctx_dft KV state
+                            common_speculative_flush_inject(spec.get());
+
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
@@ -4170,6 +4173,12 @@ private:
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
+            if (slot.ctx_dft) {
+                // flush async inject before modifying ctx_dft KV state
+                common_speculative_flush_inject(spec.get());
+                common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
+            }
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;

@@ -178,6 +178,15 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+
+    // true if this implementation requires the target context to extract post-norm embeddings
+    virtual bool need_embd() const = 0;
+
+    // true if this implementation requires the target context to extract pre-norm embeddings
+    virtual bool need_embd_nextn() const { return false; }
+
+    // wait for any pending async inject work to finish (no-op for synchronous impls)
+    virtual void flush_inject() {}
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1447,7 +1456,7 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
     }
 
     // wait until background inject has finished (call before draft() or begin())
-    void flush_inject() {
+    void flush_inject() override {
         std::unique_lock<std::mutex> lk(proc_mtx);
         proc_cv.wait(lk, [this] { return proc_idle; });
     }
@@ -3000,6 +3009,16 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
+    }
+}
+
+void common_speculative_flush_inject(common_speculative * spec) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->flush_inject();
     }
 }
 

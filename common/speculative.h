@@ -64,6 +64,9 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
+// wait for any pending async inject work to finish; call before ctx_dft operations outside speculative.cpp
+void common_speculative_flush_inject(common_speculative * spec);
+
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
