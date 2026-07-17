@@ -3682,8 +3682,22 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
                 }
                 msg.content = ctx.input.substr(content_start);
             } else {
-                // No reasoning marker — whole model output is content
-                msg.content = input.empty() ? ctx.input : input;
+                // No <think> found — it may have been injected via generation_prompt
+                // (harness prefill) and is absent from effective_input. If there is an
+                // orphaned </think>, split on it: everything before is reasoning tail,
+                // everything after is content.
+                size_t te_only = ctx.input.find(think_end);
+                if (te_only != std::string::npos) {
+                    msg.reasoning_content = ctx.input.substr(0, te_only);
+                    size_t content_start = te_only + think_end.size();
+                    while (content_start < ctx.input.size() &&
+                           (ctx.input[content_start] == '\n' || ctx.input[content_start] == ' ')) {
+                        content_start++;
+                    }
+                    msg.content = ctx.input.substr(content_start);
+                } else {
+                    msg.content = input.empty() ? ctx.input : input;
+                }
             }
 
             // Extract DSML tool calls if present in content.
