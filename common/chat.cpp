@@ -3608,7 +3608,11 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
 
     //LOG_DBG("Parsing PEG input with format %s: %s\n", common_chat_format_name(params.format), effective_input.c_str());
 
-    common_peg_parse_flags flags = COMMON_PEG_PARSE_FLAG_LENIENT;
+    // For complete input, drop LENIENT so that until(delimiter) returns SUCCESS
+    // (consuming all remaining input) when the delimiter is not found, instead of
+    // returning NEED_MORE_INPUT and forcing an unnecessary fallback.
+    // LENIENT is only meaningful for partial/streaming inputs where more data may arrive.
+    common_peg_parse_flags flags = is_partial ? COMMON_PEG_PARSE_FLAG_LENIENT : COMMON_PEG_PARSE_FLAG_NONE;
     if (params.debug) {
         flags |= COMMON_PEG_PARSE_FLAG_DEBUG;
     }
