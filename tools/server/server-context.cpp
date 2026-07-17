@@ -3172,6 +3172,9 @@ private:
                     } else {
                         GGML_ASSERT(slot.spec_i_batch.empty());
 
+                        // wait for any async inject (process()) to finish before touching ctx_dft
+                        common_speculative_flush_inject(spec.get());
+
                         slot.spec_ckpt.update_pos(
                                 slot.prompt.n_tokens(),
                                 llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
