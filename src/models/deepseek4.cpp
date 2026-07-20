@@ -1561,4 +1561,5 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
 
     res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);
+
 }
