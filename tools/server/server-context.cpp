@@ -1770,10 +1770,13 @@ private:
             }
         }
 
-        // sticky slot by x-claude-code-agent-id (primary) or system-prompt hash (fallback)
+        // sticky slot by agent_id (Claude sub-agents) or system-prompt hash (non-Anthropic fallback)
+        // main agent (session_id only, no agent_id) intentionally goes through LCP/LRU —
+        // its first request has no agent_id yet so session_id cannot reliably pin it without
+        // causing slot swaps when agent_id arrives on the sub-agent's second request
         if (ret == nullptr && slots.size() > 1) {
             if (!task.agent_id.empty()) {
-                // primary: Claude sub-agent — pin by agent_id header
+                // Claude sub-agent — pin by agent_id
                 server_slot * free_unassigned = nullptr;
 
                 for (server_slot & slot : slots) {
@@ -1795,29 +1798,6 @@ private:
                     ret->agent_id = task.agent_id;
                     SLT_INF(*ret, "assigned slot to agent-id (%s)\n", task.agent_id.c_str());
                 }
-            } else if (!task.session_id.empty()) {
-                // secondary: Claude main agent — pin by session_id header
-                server_slot * free_unassigned = nullptr;
-
-                for (server_slot & slot : slots) {
-                    if (slot.is_processing()) {
-                        continue;
-                    }
-                    if (slot.session_id == task.session_id && slot.agent_id.empty()) {
-                        ret = &slot;
-                        SLT_INF(slot, "selected slot by session-id (%s)\n", task.session_id.c_str());
-                        break;
-                    }
-                    if (slot.session_id.empty() && slot.agent_id.empty() && free_unassigned == nullptr) {
-                        free_unassigned = &slot;
-                    }
-                }
-
-                if (ret == nullptr && free_unassigned != nullptr) {
-                    ret = free_unassigned;
-                    ret->session_id = task.session_id;
-                    SLT_INF(*ret, "assigned slot to session-id (%s)\n", task.session_id.c_str());
-                }
             } else {
                 // fallback: non-Anthropic clients — pin by system-prompt hash
                 const uint64_t req_hash = task_system_hash(task);
@@ -1833,7 +1813,7 @@ private:
                             SLT_INF(slot, "selected slot by system-prompt hash (0x%016" PRIx64 ")\n", req_hash);
                             break;
                         }
-                        if (slot.system_hash == 0 && slot.agent_id.empty() && slot.session_id.empty() && free_unassigned == nullptr) {
+                        if (slot.system_hash == 0 && slot.agent_id.empty() && free_unassigned == nullptr) {
                             free_unassigned = &slot;
                         }
                     }
@@ -2103,9 +2083,6 @@ private:
         // stamp identity keys if not yet set (covers LRU-selected slots)
         if (slot.agent_id.empty() && !task.agent_id.empty()) {
             slot.agent_id = task.agent_id;
-        }
-        if (slot.session_id.empty() && !task.session_id.empty() && slot.agent_id.empty()) {
-            slot.session_id = task.session_id;
         }
         if (slot.system_hash == 0) {
             slot.system_hash = task_system_hash(task);
