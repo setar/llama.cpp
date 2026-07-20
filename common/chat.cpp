@@ -3711,29 +3711,41 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
             // parallel invocations) but model produced a valid DSML block.
             {
                 const std::string FC_START = "<｜DSML｜function_calls>";
+                const std::string TC_START = "<｜DSML｜tool_calls>";
                 const std::string INV_S    = "<｜DSML｜invoke";
                 const std::string INV_E    = "</｜DSML｜invoke>";
                 const std::string PRM_S    = "<｜DSML｜parameter";
                 const std::string PRM_E    = "</｜DSML｜parameter>";
 
                 const std::string FC_END   = "</｜DSML｜function_calls>";
+                const std::string TC_END   = "</｜DSML｜tool_calls>";
 
+                // Find the start of any DSML tool-call block in three forms:
+                //   <｜DSML｜function_calls>  — canonical wrapper
+                //   <｜DSML｜tool_calls>       — alternate wrapper used by some model variants
+                //   <｜DSML｜invoke            — bare invoke without any wrapper
                 size_t fc_pos = msg.content.find(FC_START);
-                // Also handle bare <invoke> without FC_START wrapper (model may omit opening tag)
+                if (fc_pos == std::string::npos) {
+                    fc_pos = msg.content.find(TC_START);
+                }
                 if (fc_pos == std::string::npos) {
                     fc_pos = msg.content.find(INV_S);
                 }
                 if (fc_pos != std::string::npos) {
-                    // Truncate visible content before the DSML block; strip trailing FC_END too
+                    // Truncate visible content before the DSML block
                     std::string raw_fc = msg.content.substr(fc_pos);
                     msg.content = msg.content.substr(0, fc_pos);
                     while (!msg.content.empty() && (msg.content.back() == '\n' || msg.content.back() == ' ')) {
                         msg.content.pop_back();
                     }
-                    // Remove trailing FC_END if present (orphaned closing tag)
+                    // Strip trailing closing wrapper tags if present
                     size_t fc_end_pos = raw_fc.rfind(FC_END);
                     if (fc_end_pos != std::string::npos) {
                         raw_fc = raw_fc.substr(0, fc_end_pos);
+                    }
+                    size_t tc_end_pos = raw_fc.rfind(TC_END);
+                    if (tc_end_pos != std::string::npos) {
+                        raw_fc = raw_fc.substr(0, tc_end_pos);
                     }
 
                     // Parse each <invoke> in the block
