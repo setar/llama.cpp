@@ -1833,8 +1833,12 @@ private:
             }
         }
 
+        // remember whether a sticky path (explicit id, agent_id, system hash) already pinned a slot;
+        // if so, the LCP scan below must not reassign ret to a different slot
+        const bool sticky_pinned = ret != nullptr;
+
         // find the slot that has at least n% prompt similarity
-        if (slot_prompt_similarity != 0.0f) {
+        if (slot_prompt_similarity != 0.0f && !sticky_pinned) {
             float f_sim_best = 0;
 
             for (server_slot & slot : slots) {
