@@ -2739,7 +2739,14 @@ private:
 
                                 if (params_base.kv_unified) {
                                     // [TAG_IDLE_SLOT_CLEAR]
-                                    slot.prompt_clear();
+                                    // Keep agent-pinned slots warm: a Claude sub-agent will return
+                                    // to its slot and re-prefilling its (often large) context is
+                                    // expensive. The prompt was already saved to the cache above as a
+                                    // backup, and slots under real KV pressure are still reclaimed by
+                                    // try_clear_idle_slots() during decode.
+                                    if (slot.agent_id.empty()) {
+                                        slot.prompt_clear();
+                                    }
                                 }
                             }
                         }
