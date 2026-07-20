@@ -2130,8 +2130,10 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
     const std::string THINK_START  = "<think>";
     const std::string THINK_END    = "</think>";
     const std::string TC_BLOCK     = is_v4 ? "tool_calls" : "function_calls";
-    const std::string FC_START     = "<" + DSML + "tool_calls>";
-    const std::string FC_END       = "</" + DSML + "tool_calls>";
+    const std::string FC_START     = "<" + DSML + "function_calls>";
+    const std::string FC_END       = "</" + DSML + "function_calls>";
+    const std::string TC_START     = "<" + DSML + "tool_calls>";
+    const std::string TC_END       = "</" + DSML + "tool_calls>";
     const std::string INVOKE_START = "<" + DSML + "invoke";
     const std::string INVOKE_END   = "</" + DSML + "invoke>";
     const std::string PARAM_START  = "<" + DSML + "parameter";
@@ -2243,15 +2245,25 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
             });
         }
 
-        common_peg_parser tool_calls = p.eps();
-        if (inputs.parallel_tool_calls) {
-            tool_calls = p.trigger_rule("tool-call",
-                p.literal(FC_START) + p.space() + tool_choice +
-                p.zero_or_more(p.space() + tool_choice) + p.space() + p.literal(FC_END));
-        } else {
-            tool_calls = p.trigger_rule("tool-call",
-                p.literal(FC_START) + p.space() + tool_choice + p.space() + p.literal(FC_END));
-        }
+        // Build tool-call block for either wrapper format (function_calls or tool_calls).
+        // The model may use either format; both must be accepted by the PEG grammar.
+        auto make_tc_block = [&](const std::string & START, const std::string & END) {
+            if (inputs.parallel_tool_calls) {
+                return p.trigger_rule("tool-call",
+                    p.literal(START) + p.space() + tool_choice +
+                    p.zero_or_more(p.space() + tool_choice) + p.space() + p.literal(END));
+            } else {
+                return p.trigger_rule("tool-call",
+                    p.literal(START) + p.space() + tool_choice + p.space() + p.literal(END));
+            }
+        };
+
+        auto tc_fc = make_tc_block(FC_START, FC_END);
+        auto tc_tc = make_tc_block(TC_START, TC_END);
+        auto tool_calls_choice = p.choice();
+        tool_calls_choice |= tc_fc;
+        tool_calls_choice |= tc_tc;
+        common_peg_parser tool_calls = tool_calls_choice;
 
         auto reasoning = p.eps();
         auto reasoning_with_tc = p.eps();
@@ -2265,7 +2277,7 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
         if (extract_reasoning && inputs.enable_thinking) {
             reasoning = p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
             reasoning_with_tc = THINK_START +
-                p.reasoning(p.until_one_of({ TC_SEPARATOR + FC_START, FC_START, THINK_END })) +
+                p.reasoning(p.until_one_of({ TC_SEPARATOR + FC_START, FC_START, TC_SEPARATOR + TC_START, TC_START, THINK_END })) +
                 p.space() + obligatory_tool_calls;
             allow_reasoning_with_tc = true;
         } else if (extract_reasoning) {
@@ -2290,7 +2302,7 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
         }
 
         auto content_before_tools = p.negate(p.literal(THINK_START)) +
-            p.content(p.until_one_of({ TC_SEPARATOR + FC_START, FC_START })) +
+            p.content(p.until_one_of({ TC_SEPARATOR + FC_START, FC_START, TC_SEPARATOR + TC_START, TC_START })) +
             p.space();
         return allow_reasoning_with_tc ? generation_prompt + (reasoning_with_tc | (reasoning + content_before_tools + tool_calls)) + end :
             generation_prompt + reasoning + content_before_tools + tool_calls + end;
@@ -2315,6 +2327,7 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
 
         data.grammar_triggers = {
             { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, FC_START },
+            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, TC_START },
         };
     }
 
