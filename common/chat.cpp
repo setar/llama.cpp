@@ -3375,6 +3375,9 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
     return std::nullopt;
 }
 
+static common_chat_params common_chat_templates_apply_legacy(const struct common_chat_templates *        tmpls,
+                                                             const struct common_chat_templates_inputs & inputs);
+
 static common_chat_params common_chat_templates_apply_jinja(const struct common_chat_templates *        tmpls,
                                                             const struct common_chat_templates_inputs & inputs) {
     autoparser::generation_params params;
@@ -3514,7 +3517,8 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         LOG_DBG("%s: generated parser:\n%s\n\nparser generation prompt: %s\n", __func__, arena.dump(arena.root()).c_str(), auto_params.generation_prompt.c_str());
         return auto_params;
     } catch (const std::exception & e) {
-        throw std::invalid_argument(std::string("Unable to generate parser for this template. Automatic parser generation failed: ") + e.what());
+        LOG_WRN("%s: autoparser failed (%s), falling back to legacy template handling\n", __func__, e.what());
+        return common_chat_templates_apply_legacy(tmpls, inputs);
     }
 }
 
