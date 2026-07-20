@@ -227,6 +227,9 @@ struct server_slot {
     // x-claude-code-agent-id value — primary sticky slot key for Claude sub-agents (empty = not assigned)
     std::string agent_id;
 
+    // x-claude-code-session-id value — sticky slot key for Claude main agent (empty = not assigned)
+    std::string session_id;
+
     // generation props
     int32_t n_ctx       = 0;  // context size per slot
     int32_t n_keep      = 0;
@@ -1792,6 +1795,29 @@ private:
                     ret->agent_id = task.agent_id;
                     SLT_INF(*ret, "assigned slot to agent-id (%s)\n", task.agent_id.c_str());
                 }
+            } else if (!task.session_id.empty()) {
+                // secondary: Claude main agent — pin by session_id header
+                server_slot * free_unassigned = nullptr;
+
+                for (server_slot & slot : slots) {
+                    if (slot.is_processing()) {
+                        continue;
+                    }
+                    if (slot.session_id == task.session_id && slot.agent_id.empty()) {
+                        ret = &slot;
+                        SLT_INF(slot, "selected slot by session-id (%s)\n", task.session_id.c_str());
+                        break;
+                    }
+                    if (slot.session_id.empty() && slot.agent_id.empty() && free_unassigned == nullptr) {
+                        free_unassigned = &slot;
+                    }
+                }
+
+                if (ret == nullptr && free_unassigned != nullptr) {
+                    ret = free_unassigned;
+                    ret->session_id = task.session_id;
+                    SLT_INF(*ret, "assigned slot to session-id (%s)\n", task.session_id.c_str());
+                }
             } else {
                 // fallback: non-Anthropic clients — pin by system-prompt hash
                 const uint64_t req_hash = task_system_hash(task);
@@ -1807,7 +1833,7 @@ private:
                             SLT_INF(slot, "selected slot by system-prompt hash (0x%016" PRIx64 ")\n", req_hash);
                             break;
                         }
-                        if (slot.system_hash == 0 && slot.agent_id.empty() && free_unassigned == nullptr) {
+                        if (slot.system_hash == 0 && slot.agent_id.empty() && slot.session_id.empty() && free_unassigned == nullptr) {
                             free_unassigned = &slot;
                         }
                     }
@@ -1945,7 +1971,8 @@ private:
 
                 slot.prompt_clear();
                 slot.system_hash = 0;
-                slot.agent_id.clear(); // release sticky assignment so slot can be reused by another agent
+                slot.agent_id.clear();
+                slot.session_id.clear(); // release all sticky keys so slot can be reused
 
                 res = true;
 
@@ -2073,9 +2100,12 @@ private:
             slot.smpl.reset();
         }
 
-        // stamp agent_id / system_hash if not yet set (covers LRU-selected slots)
+        // stamp identity keys if not yet set (covers LRU-selected slots)
         if (slot.agent_id.empty() && !task.agent_id.empty()) {
             slot.agent_id = task.agent_id;
+        }
+        if (slot.session_id.empty() && !task.session_id.empty() && slot.agent_id.empty()) {
+            slot.session_id = task.session_id;
         }
         if (slot.system_hash == 0) {
             slot.system_hash = task_system_hash(task);
@@ -4491,13 +4521,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.id_slot = json_value(data, "id_slot", -1);
 
-            // read x-claude-code-agent-id for sticky slot assignment
+            // read claude identity headers for sticky slot assignment
             for (const auto & [hk, hv] : req.headers) {
                 std::string kl = hk;
                 for (auto & c : kl) c = (char)std::tolower((unsigned char)c);
                 if (kl == "x-claude-code-agent-id") {
                     task.agent_id = hv;
-                    break;
+                } else if (kl == "x-claude-code-session-id") {
+                    task.session_id = hv;
                 }
             }
 
