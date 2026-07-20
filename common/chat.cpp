@@ -2130,8 +2130,8 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
     const std::string THINK_START  = "<think>";
     const std::string THINK_END    = "</think>";
     const std::string TC_BLOCK     = is_v4 ? "tool_calls" : "function_calls";
-    const std::string FC_START     = "<" + DSML + TC_BLOCK + ">";
-    const std::string FC_END       = "</" + DSML + TC_BLOCK + ">";
+    const std::string FC_START     = "<" + DSML + "tool_calls>";
+    const std::string FC_END       = "</" + DSML + "tool_calls>";
     const std::string INVOKE_START = "<" + DSML + "invoke";
     const std::string INVOKE_END   = "</" + DSML + "invoke>";
     const std::string PARAM_START  = "<" + DSML + "parameter";
