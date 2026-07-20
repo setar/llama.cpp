@@ -2765,6 +2765,48 @@ static void system_message_not_supported(json & messages) {
     }
 }
 
+// Some templates (e.g. Qwen3) hard-require that any system message appear only as the
+// first message and raise an exception otherwise. Clients such as Claude Code legitimately
+// inject additional system messages mid-conversation (context reminders). Merge every
+// non-leading system message into the preceding message so the template does not reject it.
+static std::string message_content_as_string(const json & message) {
+    if (!message.contains("content")) {
+        return "";
+    }
+    const json & content = message.at("content");
+    if (content.is_string()) {
+        return content.get<std::string>();
+    }
+    std::string text;
+    if (content.is_array()) {
+        for (const auto & part : content) {
+            if (part.contains("type") && part.at("type") == "text" && part.contains("text") && part.at("text").is_string()) {
+                text += part.at("text").get<std::string>();
+            }
+        }
+    }
+    return text;
+}
+
+static void merge_nonleading_system_messages(json & messages) {
+    if (!messages.is_array()) {
+        return;
+    }
+    for (size_t i = messages.size(); i-- > 1; ) {
+        if (!messages[i].contains("role") || messages[i].at("role") != "system") {
+            continue;
+        }
+        std::string sys_text = message_content_as_string(messages[i]);
+        json & prev = messages[i - 1];
+        std::string prev_text = message_content_as_string(prev);
+        std::string merged = prev_text.empty() ? sys_text
+                           : (sys_text.empty() ? prev_text : prev_text + "\n" + sys_text);
+        prev["content"] = merged;
+        LOG_DBG("Merging non-leading system message at index %zu into previous message\n", i);
+        messages.erase(messages.begin() + i);
+    }
+}
+
 static void requires_non_null_content(json & messages) {
     GGML_ASSERT(messages.is_array());
     for (auto & message : messages) {
@@ -3430,6 +3472,12 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
 
     if (!tmpl.original_caps().supports_system_role) {
         workaround::system_message_not_supported(params.messages);
+    }
+
+    // Templates that require system messages only at the beginning (e.g. Qwen3) raise an
+    // exception on mid-conversation system messages that clients like Claude Code inject.
+    if (src.find("System message must be at the beginning") != std::string::npos) {
+        workaround::merge_nonleading_system_messages(params.messages);
     }
 
     if (tmpl.original_caps().supports_tool_calls) {
