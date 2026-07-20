@@ -3716,13 +3716,24 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
                 const std::string PRM_S    = "<｜DSML｜parameter";
                 const std::string PRM_E    = "</｜DSML｜parameter>";
 
+                const std::string FC_END   = "</｜DSML｜function_calls>";
+
                 size_t fc_pos = msg.content.find(FC_START);
+                // Also handle bare <invoke> without FC_START wrapper (model may omit opening tag)
+                if (fc_pos == std::string::npos) {
+                    fc_pos = msg.content.find(INV_S);
+                }
                 if (fc_pos != std::string::npos) {
-                    // Truncate visible content before the DSML block
+                    // Truncate visible content before the DSML block; strip trailing FC_END too
                     std::string raw_fc = msg.content.substr(fc_pos);
                     msg.content = msg.content.substr(0, fc_pos);
                     while (!msg.content.empty() && (msg.content.back() == '\n' || msg.content.back() == ' ')) {
                         msg.content.pop_back();
+                    }
+                    // Remove trailing FC_END if present (orphaned closing tag)
+                    size_t fc_end_pos = raw_fc.rfind(FC_END);
+                    if (fc_end_pos != std::string::npos) {
+                        raw_fc = raw_fc.substr(0, fc_end_pos);
                     }
 
                     // Parse each <invoke> in the block
