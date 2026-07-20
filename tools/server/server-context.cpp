@@ -1777,23 +1777,29 @@ private:
         if (ret == nullptr && slots.size() > 1) {
             if (!task.agent_id.empty()) {
                 // Claude sub-agent — pin by agent_id
+                // first pass: find idle slot already assigned to this agent_id
+                // also check busy slots — if found there, do NOT assign a second slot
+                bool already_assigned = false;
                 server_slot * free_unassigned = nullptr;
 
                 for (server_slot & slot : slots) {
-                    if (slot.is_processing()) {
-                        continue;
-                    }
                     if (slot.agent_id == task.agent_id) {
-                        ret = &slot;
-                        SLT_INF(slot, "selected slot by agent-id (%s)\n", task.agent_id.c_str());
+                        if (slot.is_processing()) {
+                            // agent's slot is busy — mark and skip, don't assign elsewhere
+                            already_assigned = true;
+                        } else {
+                            ret = &slot;
+                            SLT_INF(slot, "selected slot by agent-id (%s)\n", task.agent_id.c_str());
+                        }
                         break;
                     }
-                    if (slot.agent_id.empty() && free_unassigned == nullptr) {
+                    if (!slot.is_processing() && slot.agent_id.empty() && free_unassigned == nullptr) {
                         free_unassigned = &slot;
                     }
                 }
 
-                if (ret == nullptr && free_unassigned != nullptr) {
+                // only assign a fresh slot if this agent_id is not yet on any slot
+                if (ret == nullptr && !already_assigned && free_unassigned != nullptr) {
                     ret = free_unassigned;
                     ret->agent_id = task.agent_id;
                     SLT_INF(*ret, "assigned slot to agent-id (%s)\n", task.agent_id.c_str());
