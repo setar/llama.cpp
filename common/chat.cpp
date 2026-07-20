@@ -2245,25 +2245,20 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
             });
         }
 
-        // Build tool-call block for either wrapper format (function_calls or tool_calls).
-        // The model may use either format; both must be accepted by the PEG grammar.
-        auto make_tc_block = [&](const std::string & START, const std::string & END) {
-            if (inputs.parallel_tool_calls) {
-                return p.trigger_rule("tool-call",
-                    p.literal(START) + p.space() + tool_choice +
-                    p.zero_or_more(p.space() + tool_choice) + p.space() + p.literal(END));
-            } else {
-                return p.trigger_rule("tool-call",
-                    p.literal(START) + p.space() + tool_choice + p.space() + p.literal(END));
-            }
-        };
-
-        auto tc_fc = make_tc_block(FC_START, FC_END);
-        auto tc_tc = make_tc_block(TC_START, TC_END);
-        auto tool_calls_choice = p.choice();
-        tool_calls_choice |= tc_fc;
-        tool_calls_choice |= tc_tc;
-        common_peg_parser tool_calls = tool_calls_choice;
+        // PEG grammar handles FC_START (function_calls) natively via trigger_rule.
+        // TC_START (tool_calls) format is handled by the fallback extractor in
+        // common_chat_peg_parse(): content_before_tools stops at either marker so
+        // the TC block is not silently consumed as content, PEG then fails gracefully
+        // (optional tool_calls doesn't match TC_START), and the fallback extracts it.
+        common_peg_parser tool_calls = p.eps();
+        if (inputs.parallel_tool_calls) {
+            tool_calls = p.trigger_rule("tool-call",
+                p.literal(FC_START) + p.space() + tool_choice +
+                p.zero_or_more(p.space() + tool_choice) + p.space() + p.literal(FC_END));
+        } else {
+            tool_calls = p.trigger_rule("tool-call",
+                p.literal(FC_START) + p.space() + tool_choice + p.space() + p.literal(FC_END));
+        }
 
         auto reasoning = p.eps();
         auto reasoning_with_tc = p.eps();
@@ -2327,7 +2322,6 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
 
         data.grammar_triggers = {
             { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, FC_START },
-            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, TC_START },
         };
     }
 
