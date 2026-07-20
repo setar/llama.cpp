@@ -221,6 +221,9 @@ struct server_slot {
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
 
+    // hash of system-prompt tokens — sticky slot assignment per agent type (0 = not yet assigned)
+    uint64_t system_hash = 0;
+
     // generation props
     int32_t n_ctx       = 0;  // context size per slot
     int32_t n_keep      = 0;
@@ -1726,6 +1729,28 @@ private:
         return nullptr;
     }
 
+    // compute FNV-1a hash over a range of tokens — used for system-prompt sticky slot assignment
+    static uint64_t hash_token_range(const server_tokens & tokens, size_t pos, size_t len) {
+        uint64_t h = 14695981039346656037ULL;
+        const size_t end = std::min(pos + len, tokens.size());
+        for (size_t i = pos; i < end; ++i) {
+            uint64_t v = (uint64_t)(uint32_t) tokens[i];
+            h ^= v;
+            h *= 1099511628211ULL;
+        }
+        return h ? h : 1; // never return 0 (reserved for "not assigned")
+    }
+
+    // extract hash of the system-prompt span from task tokens (0 if no system span found)
+    static uint64_t task_system_hash(const server_task & task) {
+        for (const auto & span : task.params.message_spans.spans) {
+            if (span.role == COMMON_CHAT_ROLE_SYSTEM && span.len > 0) {
+                return hash_token_range(task.tokens, span.pos, span.len);
+            }
+        }
+        return 0;
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
@@ -1736,6 +1761,35 @@ private:
             ret = get_slot_by_id(task.id_slot);
             if (ret) {
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+            }
+        }
+
+        // sticky slot by system-prompt hash: prefer the slot already assigned to this agent type
+        if (ret == nullptr && slots.size() > 1) {
+            const uint64_t req_hash = task_system_hash(task);
+            if (req_hash != 0) {
+                server_slot * free_unassigned = nullptr; // best fallback: free slot with no hash yet
+
+                for (server_slot & slot : slots) {
+                    if (slot.is_processing()) {
+                        continue;
+                    }
+                    if (slot.system_hash == req_hash) {
+                        ret = &slot;
+                        SLT_INF(slot, "selected slot by system-prompt hash (0x%016" PRIx64 ")\n", req_hash);
+                        break;
+                    }
+                    if (slot.system_hash == 0 && free_unassigned == nullptr) {
+                        free_unassigned = &slot;
+                    }
+                }
+
+                // assign a fresh slot and stamp it with this hash
+                if (ret == nullptr && free_unassigned != nullptr) {
+                    ret = free_unassigned;
+                    ret->system_hash = req_hash;
+                    SLT_INF(*ret, "assigned slot to system-prompt hash (0x%016" PRIx64 ")\n", req_hash);
+                }
             }
         }
 
@@ -1862,6 +1916,7 @@ private:
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
                 slot.prompt_clear();
+                slot.system_hash = 0; // release sticky assignment so slot can be reused by another agent type
 
                 res = true;
 
@@ -1987,6 +2042,11 @@ private:
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
         } else {
             slot.smpl.reset();
+        }
+
+        // update system_hash if not yet stamped (covers LRU-selected slots)
+        if (slot.system_hash == 0) {
+            slot.system_hash = task_system_hash(task);
         }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
@@ -4398,6 +4458,24 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
 
             task.id_slot = json_value(data, "id_slot", -1);
+
+            // TEMP DEBUG: log top-level JSON keys to identify session identifiers
+            {
+                std::string keys;
+                for (auto & el : data.items()) {
+                    if (!keys.empty()) keys += ", ";
+                    keys += el.key();
+                }
+                SRV_INF("incoming json keys: %s\n", keys.c_str());
+                // log specific fields if present
+                auto it_s = data.find("session_info");
+                if (it_s != data.end()) SRV_INF("  session_info: %s\n", it_s->dump().c_str());
+                auto it_m = data.find("metadata");
+                if (it_m != data.end()) SRV_INF("  metadata: %s\n", it_m->dump().c_str());
+                auto it_c = data.find("client_id");
+                if (it_c != data.end()) SRV_INF("  client_id: %s\n", it_c->dump().c_str());
+            }
+
             sse_ping_interval = task.params.sse_ping_interval;
 
             // OAI-compat
@@ -5108,7 +5186,22 @@ void server_routes::init_routes() {
     this->post_anthropic_messages = [this](const server_http_req & req) {
         auto res = create_response();
         std::vector<raw_buffer> files;
-        json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
+        json orig_body = json::parse(req.body);
+        // TEMP DEBUG: log incoming Anthropic request top-level keys and headers
+        {
+            std::string keys;
+            for (auto & el : orig_body.items()) { if (!keys.empty()) keys += ", "; keys += el.key(); }
+            SRV_INF("anthropic json keys: %s\n", keys.c_str());
+            // dump header map keys
+            std::string hkeys;
+            for (auto & [k, v] : req.headers) { if (!hkeys.empty()) hkeys += ", "; hkeys += k; }
+            SRV_INF("anthropic headers: %s\n", hkeys.c_str());
+            auto it_s = orig_body.find("session_info");
+            if (it_s != orig_body.end()) SRV_INF("  session_info: %s\n", it_s->dump().c_str());
+            auto it_m = orig_body.find("metadata");
+            if (it_m != orig_body.end()) SRV_INF("  metadata: %s\n", it_m->dump().c_str());
+        }
+        json body = server_chat_convert_anthropic_to_oai(std::move(orig_body));
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
         json body_parsed = oaicompat_chat_params_parse(
