@@ -221,8 +221,11 @@ struct server_slot {
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
 
-    // hash of system-prompt tokens — sticky slot assignment per agent type (0 = not yet assigned)
+    // hash of system-prompt tokens — fallback sticky slot key for non-Anthropic clients (0 = not assigned)
     uint64_t system_hash = 0;
+
+    // x-claude-code-agent-id value — primary sticky slot key for Claude sub-agents (empty = not assigned)
+    std::string agent_id;
 
     // generation props
     int32_t n_ctx       = 0;  // context size per slot
@@ -1764,31 +1767,56 @@ private:
             }
         }
 
-        // sticky slot by system-prompt hash: prefer the slot already assigned to this agent type
+        // sticky slot by x-claude-code-agent-id (primary) or system-prompt hash (fallback)
         if (ret == nullptr && slots.size() > 1) {
-            const uint64_t req_hash = task_system_hash(task);
-            if (req_hash != 0) {
-                server_slot * free_unassigned = nullptr; // best fallback: free slot with no hash yet
+            if (!task.agent_id.empty()) {
+                // primary: Claude sub-agent — pin by agent_id header
+                server_slot * free_unassigned = nullptr;
 
                 for (server_slot & slot : slots) {
                     if (slot.is_processing()) {
                         continue;
                     }
-                    if (slot.system_hash == req_hash) {
+                    if (slot.agent_id == task.agent_id) {
                         ret = &slot;
-                        SLT_INF(slot, "selected slot by system-prompt hash (0x%016" PRIx64 ")\n", req_hash);
+                        SLT_INF(slot, "selected slot by agent-id (%s)\n", task.agent_id.c_str());
                         break;
                     }
-                    if (slot.system_hash == 0 && free_unassigned == nullptr) {
+                    if (slot.agent_id.empty() && free_unassigned == nullptr) {
                         free_unassigned = &slot;
                     }
                 }
 
-                // assign a fresh slot and stamp it with this hash
                 if (ret == nullptr && free_unassigned != nullptr) {
                     ret = free_unassigned;
-                    ret->system_hash = req_hash;
-                    SLT_INF(*ret, "assigned slot to system-prompt hash (0x%016" PRIx64 ")\n", req_hash);
+                    ret->agent_id = task.agent_id;
+                    SLT_INF(*ret, "assigned slot to agent-id (%s)\n", task.agent_id.c_str());
+                }
+            } else {
+                // fallback: non-Anthropic clients — pin by system-prompt hash
+                const uint64_t req_hash = task_system_hash(task);
+                if (req_hash != 0) {
+                    server_slot * free_unassigned = nullptr;
+
+                    for (server_slot & slot : slots) {
+                        if (slot.is_processing()) {
+                            continue;
+                        }
+                        if (slot.system_hash == req_hash) {
+                            ret = &slot;
+                            SLT_INF(slot, "selected slot by system-prompt hash (0x%016" PRIx64 ")\n", req_hash);
+                            break;
+                        }
+                        if (slot.system_hash == 0 && slot.agent_id.empty() && free_unassigned == nullptr) {
+                            free_unassigned = &slot;
+                        }
+                    }
+
+                    if (ret == nullptr && free_unassigned != nullptr) {
+                        ret = free_unassigned;
+                        ret->system_hash = req_hash;
+                        SLT_INF(*ret, "assigned slot to system-prompt hash (0x%016" PRIx64 ")\n", req_hash);
+                    }
                 }
             }
         }
@@ -1916,7 +1944,8 @@ private:
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
                 slot.prompt_clear();
-                slot.system_hash = 0; // release sticky assignment so slot can be reused by another agent type
+                slot.system_hash = 0;
+                slot.agent_id.clear(); // release sticky assignment so slot can be reused by another agent
 
                 res = true;
 
@@ -2044,7 +2073,10 @@ private:
             slot.smpl.reset();
         }
 
-        // update system_hash if not yet stamped (covers LRU-selected slots)
+        // stamp agent_id / system_hash if not yet set (covers LRU-selected slots)
+        if (slot.agent_id.empty() && !task.agent_id.empty()) {
+            slot.agent_id = task.agent_id;
+        }
         if (slot.system_hash == 0) {
             slot.system_hash = task_system_hash(task);
         }
@@ -4459,6 +4491,16 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.id_slot = json_value(data, "id_slot", -1);
 
+            // read x-claude-code-agent-id for sticky slot assignment
+            for (const auto & [hk, hv] : req.headers) {
+                std::string kl = hk;
+                for (auto & c : kl) c = (char)std::tolower((unsigned char)c);
+                if (kl == "x-claude-code-agent-id") {
+                    task.agent_id = hv;
+                    break;
+                }
+            }
+
             // TEMP DEBUG: log top-level JSON keys to identify session identifiers
             {
                 std::string keys;
@@ -5196,6 +5238,14 @@ void server_routes::init_routes() {
             std::string hkeys;
             for (auto & [k, v] : req.headers) { if (!hkeys.empty()) hkeys += ", "; hkeys += k; }
             SRV_INF("anthropic headers: %s\n", hkeys.c_str());
+            // log values of agent-identity headers
+            for (auto & [k, v] : req.headers) {
+                std::string kl = k;
+                for (auto & c : kl) c = (char)std::tolower((unsigned char)c);
+                if (kl == "x-claude-code-session-id" || kl == "x-claude-code-agent-id") {
+                    SRV_INF("  %s: %s\n", k.c_str(), v.c_str());
+                }
+            }
             auto it_s = orig_body.find("session_info");
             if (it_s != orig_body.end()) SRV_INF("  session_info: %s\n", it_s->dump().c_str());
             auto it_m = orig_body.find("metadata");

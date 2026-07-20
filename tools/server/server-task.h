@@ -143,6 +143,9 @@ struct server_task {
     int id_target = -1;
     int id_slot   = -1;
 
+    // x-claude-code-agent-id header value — used for sticky slot assignment per sub-agent
+    std::string agent_id;
+
     // used by parallel sampling (multiple completions from same prompt)
     int id_parent  = -1;
     // temporary store of child tasks for scheduling
