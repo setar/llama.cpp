@@ -1924,6 +1924,13 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
+                // wait for any async speculative inject (proc_worker) to finish before
+                // prompt_save/prompt_load touch ctx_dft — a concurrent inject races on the
+                // shared draft context and segfaults (DeepSeek DSpark async pipeline)
+                if (spec) {
+                    common_speculative_flush_inject(spec.get());
+                }
+
                 ret->prompt_save(*prompt_cache);
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
@@ -2728,6 +2735,11 @@ private:
                     }
 
                     if (params_base.cache_idle_slots) {
+                        // flush async speculative inject before prompt_save/prompt_clear touch
+                        // the shared ctx_dft — avoids race with proc_worker (DeepSeek DSpark)
+                        if (spec) {
+                            common_speculative_flush_inject(spec.get());
+                        }
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
