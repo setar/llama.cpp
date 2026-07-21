@@ -3640,16 +3640,19 @@ private:
                                         checkpoint_match
                                     );
 
-                                    // Fallback: if no position match but checkpoints exist (cold KV cache),
-                                    // pick the best checkpoint that fits within the current task (prefix match).
-                                    // Only accept checkpoints whose n_tokens <= task size — otherwise the
-                                    // checkpoint is from a different conversation and restoring it would
-                                    // corrupt the KV cache.
+                                    // Fallback: if no position match but checkpoints exist, pick the best
+                                    // checkpoint that lies fully within the verified common prefix (n_past).
+                                    // A checkpoint whose n_tokens exceeds n_past covers tokens beyond the point
+                                    // where the current task diverged from the cached content (e.g. Claude Code
+                                    // edited/compacted the context) — restoring it would put the KV cache into
+                                    // a stale state and, on models without partial seq_rm support, abort in
+                                    // common_context_seq_rm when the divergent tail is trimmed. Bounding by
+                                    // n_past (not the full task size) guarantees the checkpoint is a genuine
+                                    // prefix; if none qualifies we fall through to do_reset (full re-process).
                                     if (it == slot.prompt.checkpoints.rend() && !slot.prompt.checkpoints.empty()) {
-                                        SLT_TRC(slot, "%s", "no position match, trying latest compatible checkpoint as fallback\n");
-                                        // Find the checkpoint with the most tokens that fits within the task
+                                        SLT_TRC(slot, "%s", "no position match, trying latest checkpoint within common prefix as fallback\n");
                                         for (auto rit = slot.prompt.checkpoints.rbegin(); rit != slot.prompt.checkpoints.rend(); ++rit) {
-                                            if ((int64_t) rit->n_tokens <= slot.task->n_tokens()) {
+                                            if ((int64_t) rit->n_tokens <= (int64_t) n_past) {
                                                 it = rit;
                                                 break;
                                             }
