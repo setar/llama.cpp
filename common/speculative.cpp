@@ -1294,16 +1294,18 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
     };
     std::mutex              proc_mtx;
     std::condition_variable proc_cv;
-    bool                    proc_idle  = true;  // background thread has no pending work
-    bool                    proc_stop  = false;
-    bool                    proc_ok    = true;  // false on encode/inject error
-    InjectWork              proc_work;
-    bool                    proc_work_ready = false;
+    bool                    proc_stop         = false;
+    std::deque<InjectWork>  proc_queue;                  // pending inject items
+    size_t                  proc_total_pending = 0;      // items in queue + currently executing
+    std::vector<size_t>     proc_seq_pending;            // per-seq pending count
+    std::vector<bool>       proc_seq_ok;                 // per-seq error flag
     std::thread             proc_thread;
 
     common_speculative_impl_draft_dspark(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, n_seq)
         , params(params.draft)
+        , proc_seq_pending(n_seq, 0)
+        , proc_seq_ok     (n_seq, true)
     {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
@@ -1385,7 +1387,7 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
         llama_batch_free(batch_inject);
     }
 
-    // background worker: runs encode+inject for one InjectWork item at a time
+    // background worker: drains proc_queue one item at a time
     void proc_worker() {
         auto * ctx_dft         = this->params.ctx_dft;
         llama_memory_t mem_dft = llama_get_memory(ctx_dft);
@@ -1395,12 +1397,12 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             InjectWork work;
             {
                 std::unique_lock<std::mutex> lk(proc_mtx);
-                proc_cv.wait(lk, [this] { return proc_work_ready || proc_stop; });
-                if (proc_stop && !proc_work_ready) {
+                proc_cv.wait(lk, [this] { return !proc_queue.empty() || proc_stop; });
+                if (proc_stop && proc_queue.empty()) {
                     break;
                 }
-                work = std::move(proc_work);
-                proc_work_ready = false;
+                work = std::move(proc_queue.front());
+                proc_queue.pop_front();
             }
 
             const int32_t n_rows = (int32_t) work.positions.size();
@@ -1448,17 +1450,18 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
 
             {
                 std::lock_guard<std::mutex> lk(proc_mtx);
-                proc_idle = true;
-                if (!ok) { proc_ok = false; }
+                proc_seq_pending[work.seq_id]--;
+                proc_total_pending--;
+                if (!ok) { proc_seq_ok[work.seq_id] = false; }
             }
             proc_cv.notify_all();
         }
     }
 
-    // wait until background inject has finished (call before draft() or begin())
+    // wait until ALL pending inject work across all sequences has finished
     void flush_inject() override {
         std::unique_lock<std::mutex> lk(proc_mtx);
-        proc_cv.wait(lk, [this] { return proc_idle; });
+        proc_cv.wait(lk, [this] { return proc_total_pending == 0; });
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1471,11 +1474,13 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             return;
         }
 
-        // flush any pending async inject and reset error state for this new generation
+        // ctx_dft is shared by all sequences.  Do not inspect or otherwise touch
+        // its memory while the worker may be running llama_encode/llama_decode
+        // for another sequence.
         flush_inject();
         {
             std::lock_guard<std::mutex> lk(proc_mtx);
-            proc_ok = true;
+            proc_seq_ok[seq_id] = true;
         }
 
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
@@ -1522,12 +1527,13 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
 
-            // wait for the previous async inject to finish before preparing a new one:
-            // ensures no two InjectWork items race on ctx_dft or the same seq KV rows
+            // wait only if THIS seq_id already has pending inject work —
+            // prevents two InjectWork items for the same seq from racing on ctx_dft KV rows.
+            // Items for different seq_ids can overlap safely since they operate on separate KV rows.
             {
                 std::unique_lock<std::mutex> lk(proc_mtx);
-                proc_cv.wait(lk, [this] { return proc_idle; });
-                if (!proc_ok) { return false; }
+                proc_cv.wait(lk, [this, seq_id] { return proc_seq_pending[seq_id] == 0; });
+                if (!proc_seq_ok[seq_id]) { return false; }
             }
 
             // gather hidden states from target layers into InjectWork (CPU copy, fast)
@@ -1551,17 +1557,23 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                 work.positions[i] = batch_in.pos[i_batch_beg[seq_id] + i];
             }
 
-            // hand off to background thread; encode+inject overlaps with next main decode
+            // enqueue for background thread; encode+inject overlaps with next main decode.
+            // different seq_ids can be queued simultaneously and will be processed sequentially.
             {
                 std::lock_guard<std::mutex> lk(proc_mtx);
-                proc_work       = std::move(work);
-                proc_work_ready = true;
-                proc_idle       = false;
+                proc_seq_pending[seq_id]++;
+                proc_total_pending++;
+                proc_queue.push_back(std::move(work));
             }
             proc_cv.notify_one();
         }
 
-        return proc_ok;
+        // return false if any seq has an error
+        std::lock_guard<std::mutex> lk(proc_mtx);
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_batch_beg[seq_id] >= 0 && !proc_seq_ok[seq_id]) { return false; }
+        }
+        return true;
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
