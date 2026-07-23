@@ -3643,6 +3643,14 @@ private:
                                     // can be restored even when LCP similarity doesn't match)
                                     auto checkpoint_match = [&](const auto & cur) {
                                         SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
+                                        // A checkpoint whose n_tokens exceeds the current task would cause the
+                                        // n_past override below (line ~3644) to set n_past > task->n_tokens().
+                                        // The prompt-processing loop then never completes because
+                                        // slot.prompt.n_tokens() can never equal task->n_tokens(), creating
+                                        // an infinite checkpoint-create/evict cycle that blocks the slot.
+                                        if (cur.n_tokens > (int64_t) slot.task->n_tokens()) {
+                                            return false;
+                                        }
                                         return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                                     };
 
