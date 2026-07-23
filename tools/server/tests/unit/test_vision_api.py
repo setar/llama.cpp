@@ -146,6 +146,46 @@ def test_vision_completion(prompt, image_data, success, re_content):
         assert res.status_code != 200
 
 
+def test_multimodal_slot_actions():
+    global server
+    server.slot_save_path = "./tmp"
+    server.server_slots = True
+    server.start()
+
+    res = server.make_request("POST", "/completions", data={
+        "id_slot": 1,
+        "cache_prompt": True,
+        "temperature": 0.0,
+        "top_k": 1,
+        "prompt": {
+            JSON_PROMPT_STRING_KEY: "What is this: <__media__>\n",
+            JSON_MULTIMODAL_KEY: [get_img_url("IMG_BASE64_0")],
+        },
+    })
+    assert res.status_code == 200
+
+    # The legacy slot file has no representation for mtmd_input_chunk or the
+    # media index map. Reject persistence before touching either the file or KV.
+    for action in ("save", "restore"):
+        res = server.make_request("POST", f"/slots/1?action={action}", data={
+            "filename": "multimodal-slot.bin",
+        })
+        assert res.status_code == 501
+        message = res.body["error"]["message"]
+        assert "does not preserve media chunks" in message
+        assert "erase action is supported" in message
+
+    res = server.make_request("POST", "/slots/1?action=erase")
+    assert res.status_code == 200
+    assert res.body["id_slot"] == 1
+    assert res.body["n_erased"] > 0
+
+    slots = server.make_request("GET", "/slots")
+    assert slots.status_code == 200
+    slot = next(item for item in slots.body if item["id"] == 1)
+    assert slot["n_prompt_tokens"] == 0
+
+
 @pytest.mark.parametrize(
     "prompt, image_data, success",
     [

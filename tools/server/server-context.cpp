@@ -2338,6 +2338,16 @@ private:
             send_error(id_task,
                 "This operation is not supported while the slot holds image/audio tokens (a pure-text prefix is supported)",
                 ERROR_TYPE_NOT_SUPPORTED);
+    // The legacy slot file contains llama KV state and a flat token array only.
+    // It cannot represent the mtmd_input_chunk objects (including their IDs,
+    // token/position spans, and encoded media) held by server_tokens.
+    bool check_slot_persistence_supported(const int id_task) {
+        if (mctx) {
+            send_error(
+                    id_task,
+                    "Slot save/restore is unavailable on a multimodal server because the slot file format "
+                    "does not preserve media chunks. The erase action is supported.",
+                    ERROR_TYPE_NOT_SUPPORTED);
             return false;
         }
         return true;
@@ -2866,6 +2876,10 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
+                    if (!check_slot_persistence_supported(task.id)) {
+                        break;
+                    }
+
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -2906,6 +2920,7 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
+                    if (!check_slot_persistence_supported(task.id)) break;
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -2972,7 +2987,13 @@ private:
                     // Erase token cache
                     const size_t n_erased = slot->prompt.tokens.size();
 
+                    for (const auto & checkpoint : slot->prompt.checkpoints) {
+                        remove_checkpoint_file(checkpoint.filepath);
+                    }
                     slot->prompt_clear();
+                    slot->system_hash = 0;
+                    slot->agent_id.clear();
+                    slot->session_id.clear();
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
                     res->id       = task.id;

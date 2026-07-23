@@ -217,7 +217,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--metrics` | enable prometheus compatible metrics endpoint (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_METRICS) |
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
 | `--slots, --no-slots` | expose slots monitoring endpoint (default: enabled)<br/>(env: LLAMA_ARG_ENDPOINT_SLOTS) |
-| `--slot-save-path PATH` | path to save slot kv cache (default: disabled) |
+| `--slot-save-path PATH` | path to save slot KV cache (default: disabled). On multimodal servers, slot `erase` is supported, but `save` and `restore` are rejected because the current slot file format does not preserve media chunks. |
 | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
 | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
@@ -1084,6 +1084,8 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 
 `filename`: Name of the file to save the slot's prompt cache. The file will be saved in the directory specified by the `--slot-save-path` server parameter.
 
+Multimodal limitation: the current slot file contains KV state and text token IDs, but not the `mtmd_input_chunk` objects and media index map needed to identify image/audio spans. Therefore `save` is rejected on a multimodal server before a file is written.
+
 **Response format**
 
 ```json
@@ -1104,6 +1106,8 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 
 `filename`: Name of the file to restore the slot's prompt cache from. The file should be located in the directory specified by the `--slot-save-path` server parameter.
 
+Multimodal limitation: `restore` is rejected before the slot KV is modified because the current file format cannot restore or validate the media state associated with the saved KV.
+
 **Response format**
 
 ```json
@@ -1119,6 +1123,8 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 ```
 
 ### POST `/slots/{id_slot}?action=erase`: Erase the prompt cache of the specified slot.
+
+`erase` is supported for both text-only and multimodal servers. It clears the target and draft KV state, prompt/media state, context checkpoints, and sticky slot-affinity mapping after the slot becomes idle.
 
 **Response format**
 
