@@ -39,6 +39,18 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+static bool server_affinity_id_valid(const std::string & value) {
+    if (value.empty() || value.size() > 256) {
+        return false;
+    }
+    for (const unsigned char c : value) {
+        if (c < 0x21 || c > 0x7e) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -1757,10 +1769,24 @@ private:
         return 0;
     }
 
+    static uint64_t affinity_hash(const std::string & value) {
+        uint64_t h = 1469598103934665603ULL;
+        for (const unsigned char c : value) {
+            h ^= c;
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+
+    static uint32_t affinity_short_hash(const std::string & value) {
+        return static_cast<uint32_t>(affinity_hash(value));
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
+        bool affinity_busy = false;
 
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
@@ -1770,39 +1796,64 @@ private:
             }
         }
 
-        // sticky slot by agent_id (Claude sub-agents) or system-prompt hash (non-Anthropic fallback)
-        // main agent (session_id only, no agent_id) intentionally goes through LCP/LRU —
-        // its first request has no agent_id yet so session_id cannot reliably pin it without
-        // causing slot swaps when agent_id arrives on the sub-agent's second request
+        // Sticky slot by typed Claude identity. agent_id takes precedence over session_id,
+        // so sub-agents do not collide with the main agent from the same session.
         if (ret == nullptr && slots.size() > 1) {
             if (!task.agent_id.empty()) {
-                // Claude sub-agent — pin by agent_id
-                // first pass: find idle slot already assigned to this agent_id
-                // also check busy slots — if found there, do NOT assign a second slot
-                bool already_assigned = false;
                 server_slot * free_unassigned = nullptr;
 
                 for (server_slot & slot : slots) {
                     if (slot.agent_id == task.agent_id) {
                         if (slot.is_processing()) {
-                            // agent's slot is busy — mark and skip, don't assign elsewhere
-                            already_assigned = true;
+                            affinity_busy = true;
+                            SLT_DBG(slot, "waiting for busy agent-id mapping (%08" PRIx32 ")\n",
+                                    affinity_short_hash(task.agent_id));
                         } else {
                             ret = &slot;
-                            SLT_INF(slot, "selected slot by agent-id (%s)\n", task.agent_id.c_str());
+                            SLT_INF(slot, "selected slot by agent-id (%08" PRIx32 ")\n",
+                                    affinity_short_hash(task.agent_id));
                         }
                         break;
                     }
-                    if (!slot.is_processing() && slot.agent_id.empty() && free_unassigned == nullptr) {
+                    if (!slot.is_processing() && slot.agent_id.empty() && slot.session_id.empty() &&
+                        free_unassigned == nullptr) {
                         free_unassigned = &slot;
                     }
                 }
 
-                // only assign a fresh slot if this agent_id is not yet on any slot
-                if (ret == nullptr && !already_assigned && free_unassigned != nullptr) {
+                if (ret == nullptr && !affinity_busy && free_unassigned != nullptr) {
                     ret = free_unassigned;
                     ret->agent_id = task.agent_id;
-                    SLT_INF(*ret, "assigned slot to agent-id (%s)\n", task.agent_id.c_str());
+                    SLT_INF(*ret, "assigned slot to agent-id (%08" PRIx32 ")\n",
+                            affinity_short_hash(task.agent_id));
+                }
+            } else if (!task.session_id.empty()) {
+                server_slot * free_unassigned = nullptr;
+
+                for (server_slot & slot : slots) {
+                    if (slot.session_id == task.session_id && slot.agent_id.empty()) {
+                        if (slot.is_processing()) {
+                            affinity_busy = true;
+                            SLT_DBG(slot, "waiting for busy session-id mapping (%08" PRIx32 ")\n",
+                                    affinity_short_hash(task.session_id));
+                        } else {
+                            ret = &slot;
+                            SLT_INF(slot, "selected slot by session-id (%08" PRIx32 ")\n",
+                                    affinity_short_hash(task.session_id));
+                        }
+                        break;
+                    }
+                    if (!slot.is_processing() && slot.agent_id.empty() && slot.session_id.empty() &&
+                        free_unassigned == nullptr) {
+                        free_unassigned = &slot;
+                    }
+                }
+
+                if (ret == nullptr && !affinity_busy && free_unassigned != nullptr) {
+                    ret = free_unassigned;
+                    ret->session_id = task.session_id;
+                    SLT_INF(*ret, "assigned slot to session-id (%08" PRIx32 ")\n",
+                            affinity_short_hash(task.session_id));
                 }
             } else {
                 // fallback: non-Anthropic clients — pin by system-prompt hash
@@ -1819,7 +1870,8 @@ private:
                             SLT_INF(slot, "selected slot by system-prompt hash (0x%016" PRIx64 ")\n", req_hash);
                             break;
                         }
-                        if (slot.system_hash == 0 && slot.agent_id.empty() && free_unassigned == nullptr) {
+                        if (slot.system_hash == 0 && slot.agent_id.empty() && slot.session_id.empty() &&
+                            free_unassigned == nullptr) {
                             free_unassigned = &slot;
                         }
                     }
@@ -1833,7 +1885,13 @@ private:
             }
         }
 
-        // remember whether a sticky path (explicit id, agent_id, system hash) already pinned a slot;
+        // A request whose affinity slot is busy must wait instead of falling through to
+        // LCP/LRU and executing concurrently in a second slot.
+        if (affinity_busy) {
+            return nullptr;
+        }
+
+        // remember whether a sticky path (explicit id, Claude identity, system hash) already pinned a slot;
         // if so, the LCP scan below must not reassign ret to a different slot
         const bool sticky_pinned = ret != nullptr;
 
@@ -2097,11 +2155,27 @@ private:
             slot.smpl.reset();
         }
 
-        // stamp identity keys if not yet set (covers LRU-selected slots)
-        if (slot.agent_id.empty() && !task.agent_id.empty()) {
+        // Stamp the selected typed identity. LRU reuse evicts the previous mapping.
+        if (!task.agent_id.empty()) {
+            if ((!slot.agent_id.empty() && slot.agent_id != task.agent_id) || !slot.session_id.empty()) {
+                SLT_INF(slot, "%s", "evicted affinity mapping during agent-id reassignment\n");
+            }
             slot.agent_id = task.agent_id;
-        }
-        if (slot.system_hash == 0) {
+            slot.session_id.clear();
+            slot.system_hash = 0;
+        } else if (!task.session_id.empty()) {
+            if (!slot.agent_id.empty() || (!slot.session_id.empty() && slot.session_id != task.session_id)) {
+                SLT_INF(slot, "%s", "evicted affinity mapping during session-id reassignment\n");
+            }
+            slot.agent_id.clear();
+            slot.session_id = task.session_id;
+            slot.system_hash = 0;
+        } else {
+            if (!slot.agent_id.empty() || !slot.session_id.empty()) {
+                SLT_INF(slot, "%s", "evicted affinity mapping for request without Claude identity\n");
+            }
+            slot.agent_id.clear();
+            slot.session_id.clear();
             slot.system_hash = task_system_hash(task);
         }
 
@@ -2761,12 +2835,10 @@ private:
 
                                 if (params_base.kv_unified) {
                                     // [TAG_IDLE_SLOT_CLEAR]
-                                    // Keep agent-pinned slots warm: a Claude sub-agent will return
-                                    // to its slot and re-prefilling its (often large) context is
-                                    // expensive. The prompt was already saved to the cache above as a
-                                    // backup, and slots under real KV pressure are still reclaimed by
-                                    // try_clear_idle_slots() during decode.
-                                    if (slot.agent_id.empty()) {
+                                    // Keep Claude-affinity slots warm. The prompt was already saved
+                                    // above as a backup, and real KV pressure can still reclaim the
+                                    // slot through try_clear_idle_slots().
+                                    if (slot.agent_id.empty() && slot.session_id.empty()) {
                                         slot.prompt_clear();
                                     }
                                 }
@@ -4564,9 +4636,17 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 std::string kl = hk;
                 for (auto & c : kl) c = (char)std::tolower((unsigned char)c);
                 if (kl == "x-claude-code-agent-id") {
-                    task.agent_id = hv;
+                    if (server_affinity_id_valid(hv)) {
+                        task.agent_id = hv;
+                    } else {
+                        SRV_WRN("%s", "ignoring invalid x-claude-code-agent-id header\n");
+                    }
                 } else if (kl == "x-claude-code-session-id") {
-                    task.session_id = hv;
+                    if (server_affinity_id_valid(hv)) {
+                        task.session_id = hv;
+                    } else {
+                        SRV_WRN("%s", "ignoring invalid x-claude-code-session-id header\n");
+                    }
                 }
             }
 
@@ -5307,14 +5387,6 @@ void server_routes::init_routes() {
             std::string hkeys;
             for (auto & [k, v] : req.headers) { if (!hkeys.empty()) hkeys += ", "; hkeys += k; }
             SRV_INF("anthropic headers: %s\n", hkeys.c_str());
-            // log values of agent-identity headers
-            for (auto & [k, v] : req.headers) {
-                std::string kl = k;
-                for (auto & c : kl) c = (char)std::tolower((unsigned char)c);
-                if (kl == "x-claude-code-session-id" || kl == "x-claude-code-agent-id") {
-                    SRV_INF("  %s: %s\n", k.c_str(), v.c_str());
-                }
-            }
             auto it_s = orig_body.find("session_info");
             if (it_s != orig_body.end()) SRV_INF("  session_info: %s\n", it_s->dump().c_str());
             auto it_m = orig_body.find("metadata");
