@@ -1,8 +1,6 @@
 #include "server-chat.h"
 #include "server-common.h"
 
-#include <sstream>
-
 json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     if (!response_body.contains("input")) {
         throw std::invalid_argument("'input' is required");
@@ -331,6 +329,34 @@ static void normalize_anthropic_billing_header(std::string & system_text) {
     }
 }
 
+static bool convert_anthropic_image_block(const json & block, json & converted) {
+    if (json_value(block, "type", std::string()) != "image") {
+        return false;
+    }
+
+    json source = json_value(block, "source", json::object());
+    std::string source_type = json_value(source, "type", std::string());
+    std::string url;
+
+    if (source_type == "base64") {
+        std::string media_type = json_value(source, "media_type", std::string("image/jpeg"));
+        std::string data = json_value(source, "data", std::string());
+        url = "data:" + media_type + ";base64," + data;
+    } else if (source_type == "url") {
+        url = json_value(source, "url", std::string());
+    } else {
+        return false;
+    }
+
+    converted = {
+        {"type", "image_url"},
+        {"image_url", {
+            {"url", url}
+        }}
+    };
+    return true;
+}
+
 json server_chat_convert_anthropic_to_oai(const json & body) {
     json oai_body;
 
@@ -402,29 +428,9 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
                 } else if (type == "thinking") {
                     reasoning_content += json_value(block, "thinking", std::string());
                 } else if (type == "image") {
-                    json source = json_value(block, "source", json::object());
-                    std::string source_type = json_value(source, "type", std::string());
-
-                    if (source_type == "base64") {
-                        std::string media_type = json_value(source, "media_type", std::string("image/jpeg"));
-                        std::string data = json_value(source, "data", std::string());
-                        std::ostringstream ss;
-                        ss << "data:" << media_type << ";base64," << data;
-
-                        converted_content.push_back({
-                            {"type", "image_url"},
-                            {"image_url", {
-                                {"url", ss.str()}
-                            }}
-                        });
-                    } else if (source_type == "url") {
-                        std::string url = json_value(source, "url", std::string());
-                        converted_content.push_back({
-                            {"type", "image_url"},
-                            {"image_url", {
-                                {"url", url}
-                            }}
-                        });
+                    json converted;
+                    if (convert_anthropic_image_block(block, converted)) {
+                        converted_content.push_back(std::move(converted));
                     }
                 } else if (type == "tool_use") {
                     tool_calls.push_back({
@@ -440,70 +446,30 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
                     std::string tool_use_id = json_value(block, "tool_use_id", std::string());
 
                     auto result_content = json_value(block, "content", json());
+                    json converted_result = json::array();
                     if (result_content.is_string()) {
-                        tool_results.push_back({
-                            {"role", "tool"},
-                            {"tool_call_id", tool_use_id},
-                            {"content", result_content.get<std::string>()}
+                        converted_result.push_back({
+                            {"type", "text"},
+                            {"text", result_content.get<std::string>()}
                         });
                     } else if (result_content.is_array()) {
-                        // Single-pass: build both text and content_parts, decide format at the end
-                        std::string result_text;
-                        json content_parts = json::array();
-                        bool has_images = false;
-
                         for (const auto & c : result_content) {
-                            std::string c_type = json_value(c, "type", std::string());
-                            if (c_type == "text") {
-                                std::string text = json_value(c, "text", std::string());
-                                result_text += text;
-                                content_parts.push_back({
-                                    {"type", "text"},
-                                    {"text", text}
-                                });
-                            } else if (c_type == "image") {
-                                has_images = true;
-                                json source = json_value(c, "source", json::object());
-                                std::string source_type = json_value(source, "type", std::string());
-                                if (source_type == "base64") {
-                                    std::string media_type = json_value(source, "media_type", std::string("image/jpeg"));
-                                    std::string data = json_value(source, "data", std::string());
-                                    std::string url = "data:" + media_type + ";base64," + data;
-                                    content_parts.push_back({
-                                        {"type", "image_url"},
-                                        {"image_url", {{"url", url}}}
-                                    });
-                                } else if (source_type == "url") {
-                                    content_parts.push_back({
-                                        {"type", "image_url"},
-                                        {"image_url", {{"url", json_value(source, "url", std::string())}}}
-                                    });
+                            if (json_value(c, "type", std::string()) == "text") {
+                                converted_result.push_back(c);
+                            } else {
+                                json converted;
+                                if (convert_anthropic_image_block(c, converted)) {
+                                    converted_result.push_back(std::move(converted));
                                 }
                             }
                         }
 
-                        if (!has_images) {
-                            // Text-only: collapse to a plain string for maximum compatibility
-                            tool_results.push_back({
-                                {"role", "tool"},
-                                {"tool_call_id", tool_use_id},
-                                {"content", result_text}
-                            });
-                        } else {
-                            // Mixed or image-only: use array content parts (OpenAI multimodal tool format)
-                            tool_results.push_back({
-                                {"role", "tool"},
-                                {"tool_call_id", tool_use_id},
-                                {"content", content_parts}
-                            });
-                        }
-                    } else {
-                        tool_results.push_back({
-                            {"role", "tool"},
-                            {"tool_call_id", tool_use_id},
-                            {"content", ""}
-                        });
                     }
+                    tool_results.push_back({
+                        {"role", "tool"},
+                        {"tool_call_id", tool_use_id},
+                        {"content", converted_result.empty() ? json("") : std::move(converted_result)}
+                    });
                 }
             }
 

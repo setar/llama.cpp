@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import pytest
 import base64
+import os
 import requests
 
 from utils import *
@@ -21,7 +22,7 @@ def create_server():
     global server
     server = ServerPreset.tinyllama2()
     server.model_alias = "tinyllama-2-anthropic"
-    server.server_port = 8082
+    server.server_port = int(os.environ.get("PORT", "8082"))
     server.n_slots = 1
     server.n_ctx = 8192
     server.n_batch = 2048
@@ -34,7 +35,7 @@ def vision_server():
     server = ServerPreset.tinygemma3()
     server.offline = False  # Allow downloading the model
     server.model_alias = "tinygemma3-anthropic"
-    server.server_port = 8083  # Different port to avoid conflicts
+    server.server_port = int(os.environ.get("VISION_PORT", "8083"))
     server.n_slots = 1
     return server
 
@@ -592,6 +593,52 @@ def test_anthropic_vision_format_accepted():
     assert "image input is not supported" in res.body.get("error", {}).get("message", "").lower()
 
 
+def test_anthropic_nested_tool_result_vision_format_accepted():
+    """Nested tool_result images must reach multimodal validation."""
+    server.jinja = True
+    server.start()
+
+    red_pixel_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
+
+    res = server.make_request("POST", "/v1/messages", data={
+        "model": "test",
+        "max_tokens": 10,
+        "messages": [
+            {"role": "user", "content": "Read the image"},
+            {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "read_1",
+                    "name": "Read",
+                    "input": {"file_path": "image.png"}
+                }]
+            },
+            {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "read_1",
+                    "content": [
+                        {"type": "text", "text": "Image Size: 1x1."},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": red_pixel_png
+                            }
+                        }
+                    ]
+                }]
+            }
+        ]
+    })
+
+    assert res.status_code == 500
+    assert "image input is not supported" in res.body.get("error", {}).get("message", "").lower()
+
+
 def test_anthropic_vision_base64_with_multimodal_model(vision_server):
     """Test vision with base64 image using Anthropic format with multimodal model"""
     global server
@@ -630,6 +677,113 @@ def test_anthropic_vision_base64_with_multimodal_model(vision_server):
     assert len(res.body["content"]) > 0
     assert res.body["content"][0]["type"] == "text"
     # The model should generate some response about the image
+    assert len(res.body["content"][0]["text"]) > 0
+
+
+def test_anthropic_nested_tool_result_vision_with_multimodal_model(vision_server):
+    """Claude Code Read(image) payload is processed by the multimodal model."""
+    global server
+    server = vision_server
+    server.start()
+
+    image_base64 = get_test_image_base64()
+    res = server.make_request("POST", "/v1/messages", data={
+        "model": "test",
+        "max_tokens": 10,
+        "messages": [
+            {"role": "user", "content": "Describe the image"},
+            {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "read_1",
+                    "name": "Read",
+                    "input": {"file_path": "image.png"}
+                }]
+            },
+            {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "read_1",
+                    "content": [
+                        {"type": "text", "text": "Image Size: 640x480."},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": image_base64
+                            }
+                        }
+                    ]
+                }]
+            }
+        ]
+    })
+
+    assert res.status_code == 200, f"Expected 200, got {res.status_code}: {res.body}"
+    assert res.body["type"] == "message"
+    assert len(res.body["content"]) > 0
+    assert res.body["content"][0]["type"] == "text"
+    assert len(res.body["content"][0]["text"]) > 0
+
+
+def test_anthropic_nested_tool_result_pdf_pages_with_multimodal_model(vision_server):
+    """Claude Code Read(PDF, pages=...) page images reach the multimodal model."""
+    global server
+    server = vision_server
+    server.start()
+
+    image_base64 = get_test_image_base64()
+    res = server.make_request("POST", "/v1/messages", data={
+        "model": "test",
+        "max_tokens": 10,
+        "messages": [
+            {"role": "user", "content": "Summarize the PDF pages"},
+            {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "read_pdf_1",
+                    "name": "Read",
+                    "input": {"file_path": "document.pdf", "pages": "1-2"}
+                }]
+            },
+            {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "read_pdf_1",
+                    "content": [
+                        {"type": "text", "text": "PDF pages extracted: 2 page(s)."},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": image_base64
+                            }
+                        },
+                        {"type": "text", "text": "Page 2:"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": image_base64
+                            }
+                        }
+                    ]
+                }]
+            }
+        ]
+    })
+
+    assert res.status_code == 200, f"Expected 200, got {res.status_code}: {res.body}"
+    assert res.body["type"] == "message"
+    assert len(res.body["content"]) > 0
+    assert res.body["content"][0]["type"] == "text"
     assert len(res.body["content"][0]["text"]) > 0
 
 
