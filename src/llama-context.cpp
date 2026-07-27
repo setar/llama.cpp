@@ -675,6 +675,7 @@ void llama_context::reclassify_moe_experts() {
         return;
     }
 
+    const int64_t t_start = ggml_time_us();
     moe_mlock_ok_bytes   = 0;
     moe_mlock_fail_bytes = 0;
     moe_mlock_fail_errno = 0;
@@ -719,6 +720,8 @@ void llama_context::reclassify_moe_experts() {
         LLAMA_LOG_WARN("%s: MoE hot residency: mlock ok = %.1f MiB\n",
                 __func__, moe_mlock_ok_bytes / (1024.0 * 1024.0));
     }
+    moe_reclassify_total++;
+    moe_reclassify_time_us += ggml_time_us() - t_start;
 }
 
 void llama_context::collect_moe_stats(const llm_graph_result * res, const llama_ubatch & ubatch) {
@@ -880,6 +883,9 @@ void llama_context::apply_moe_hot_budget() {
             }
         }
 
+        if (expert_bytes[il] == 0) {
+            moe_hot_per_layer[il] = 0;
+        }
         ranked_counts[il] = expert_counts[il];
         std::sort(ranked_counts[il].begin(), ranked_counts[il].end(), std::greater<uint64_t>());
         desired_bytes += expert_bytes[il] * (size_t) moe_hot_per_layer[il];
@@ -900,7 +906,7 @@ void llama_context::apply_moe_hot_budget() {
 
     if (minimum_bytes <= budget_bytes) {
         for (size_t il = 0; il < moe_hot_per_layer.size(); ++il) {
-            allocated[il] = std::min(HOT_MIN, moe_hot_per_layer[il]);
+            allocated[il] = expert_bytes[il] > 0 ? std::min(HOT_MIN, moe_hot_per_layer[il]) : 0;
             used_bytes += expert_bytes[il] * (size_t) allocated[il];
         }
     } else {
@@ -938,6 +944,30 @@ void llama_context::apply_moe_hot_budget() {
     LLAMA_LOG_INFO("%s: MoE hot budget selected %.1f MiB of %.1f MiB, requested %.1f MiB\n",
             __func__, used_bytes / (1024.0 * 1024.0), desired_bytes / (1024.0 * 1024.0),
             budget_bytes / (1024.0 * 1024.0));
+
+    std::string layer_map;
+    for (size_t il = 0; il < moe_hot_per_layer.size(); ++il) {
+        if (expert_bytes[il] == 0) {
+            continue;
+        }
+        if (!layer_map.empty()) {
+            layer_map += ",";
+        }
+        layer_map += std::to_string(il) + ":" + std::to_string(moe_hot_per_layer[il]);
+    }
+    LLAMA_LOG_INFO("%s: MoE hot per-layer map [%s]\n", __func__, layer_map.c_str());
+
+    size_t min_expert_bytes = 0;
+    for (size_t bytes : expert_bytes) {
+        if (bytes > 0 && (min_expert_bytes == 0 || bytes < min_expert_bytes)) {
+            min_expert_bytes = bytes;
+        }
+    }
+    if (desired_bytes > budget_bytes && min_expert_bytes > 0 &&
+            budget_bytes > used_bytes && budget_bytes - used_bytes >= min_expert_bytes) {
+        LLAMA_LOG_WARN("%s: MoE hot budget left %.1f MiB unused despite eligible experts\n",
+                __func__, (budget_bytes - used_bytes) / (1024.0 * 1024.0));
+    }
 }
 
 void llama_context::update_moe_hot_auto() {
@@ -948,8 +978,6 @@ void llama_context::update_moe_hot_auto() {
 
     constexpr double COVERAGE = 0.99;
     constexpr int32_t HOT_MIN = 4;
-    constexpr int32_t HOT_MAX = 128;
-
     for (size_t il = 0; il < expert_counts.size(); ++il) {
         uint64_t total = 0;
         for (uint64_t c : expert_counts[il]) {
@@ -972,7 +1000,6 @@ void llama_context::update_moe_hot_auto() {
         }
 
         needed = std::max(HOT_MIN, std::min<int32_t>(needed, hparams.n_expert));
-        needed = std::min(needed, HOT_MAX);
         moe_hot_per_layer[il] = needed;
     }
 
@@ -4656,6 +4683,50 @@ llama_perf_context_data llama_perf_context(const llama_context * ctx) {
     data = ctx->perf_get_data();
 
     return data;
+}
+
+bool llama_get_moe_hot_stats(
+        const llama_context * ctx,
+        llama_moe_hot_stats * stats,
+        int32_t * layer_hot_counts,
+        size_t layer_hot_capacity) {
+    if (ctx == nullptr || stats == nullptr || ctx->moe_hot_count <= 0 || ctx->expert_counts.empty()) {
+        return false;
+    }
+
+    *stats = {};
+    stats->budget_configured_bytes = ctx->moe_hot_budget_bytes;
+    stats->budget_effective_bytes = ctx->moe_hot_budget_bytes;
+    if (ctx->moe_hot_budget_backoff_bytes > 0 &&
+            (stats->budget_effective_bytes == 0 ||
+             ctx->moe_hot_budget_backoff_bytes < stats->budget_effective_bytes)) {
+        stats->budget_effective_bytes = ctx->moe_hot_budget_backoff_bytes;
+    }
+    stats->locked_bytes      = ctx->moe_mlock_ok_bytes;
+    stats->lock_failed_bytes = ctx->moe_mlock_fail_bytes;
+    stats->reclassify_count  = ctx->moe_reclassify_total;
+    stats->reclassify_time_us = ctx->moe_reclassify_time_us;
+    stats->n_layers  = ctx->expert_counts.size();
+    stats->n_experts = ctx->model.hparams.n_expert;
+
+    for (size_t il = 0; il < ctx->expert_counts.size(); ++il) {
+        const int32_t hot = il < ctx->moe_hot_per_layer.size() ? ctx->moe_hot_per_layer[il] : 0;
+        stats->n_hot_experts += hot;
+        if (layer_hot_counts != nullptr && il < layer_hot_capacity) {
+            layer_hot_counts[il] = hot;
+        }
+
+        std::vector<uint64_t> counts = ctx->expert_counts[il];
+        std::sort(counts.begin(), counts.end(), std::greater<uint64_t>());
+        for (size_t rank = 0; rank < counts.size(); ++rank) {
+            if ((int32_t) rank < hot) {
+                stats->hot_expert_activations += counts[rank];
+            } else {
+                stats->cold_expert_activations += counts[rank];
+            }
+        }
+    }
+    return true;
 }
 
 void llama_perf_context_print(const llama_context * ctx) {

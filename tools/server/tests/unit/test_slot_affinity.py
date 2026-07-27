@@ -93,3 +93,24 @@ def test_slot_erase_releases_affinity_mapping():
     )
     assert replacement.status_code == 200
     assert replacement.body["id_slot"] == erased_slot
+
+
+def test_affinity_metrics_by_key_type():
+    server.server_metrics = True
+    server.start()
+
+    session_headers = {"x-claude-code-session-id": "metrics-session"}
+    agent_headers = {"x-claude-code-agent-id": "metrics-agent"}
+    complete("session assignment", session_headers)
+    complete("session hit", session_headers)
+    complete("agent assignment", agent_headers)
+    complete("agent hit", agent_headers)
+
+    response = server.make_request("GET", "/metrics")
+    assert response.status_code == 200
+    assert 'llamacpp:affinity_assigned_total{key_type="session"} 1' in response.body
+    assert 'llamacpp:affinity_hit_total{key_type="session"} 1' in response.body
+    assert 'llamacpp:affinity_assigned_total{key_type="agent"} 1' in response.body
+    assert 'llamacpp:affinity_hit_total{key_type="agent"} 1' in response.body
+    assert "metrics-session" not in response.body
+    assert "metrics-agent" not in response.body

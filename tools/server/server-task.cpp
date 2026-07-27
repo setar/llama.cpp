@@ -1565,6 +1565,31 @@ json server_task_result_metrics::to_json() {
         { "n_draft_verif_steps_total",       n_draft_verif_steps_total },
         { "n_accepted_per_pos_total",        n_accepted_per_pos_total },
 
+        { "affinity_assigned",               affinity_assigned },
+        { "affinity_hit",                    affinity_hit },
+        { "affinity_busy",                   affinity_busy },
+        { "affinity_evicted",                affinity_evicted },
+
+        { "checkpoint_restore_hit",          checkpoint_restore_hit },
+        { "checkpoint_restore_miss",         checkpoint_restore_miss },
+        { "checkpoint_full_prefill",         checkpoint_full_prefill },
+        { "checkpoint_reject_task_length",    checkpoint_reject_task_length },
+        { "checkpoint_reject_position",       checkpoint_reject_position },
+        { "checkpoint_reject_common_prefix",  checkpoint_reject_common_prefix },
+        { "checkpoint_restore_disk_error",    checkpoint_restore_disk_error },
+
+        { "moe_hot", {
+            { "budget_configured_bytes", moe_hot.budget_configured_bytes },
+            { "budget_effective_bytes",  moe_hot.budget_effective_bytes },
+            { "locked_bytes",            moe_hot.locked_bytes },
+            { "lock_failed_bytes",       moe_hot.lock_failed_bytes },
+            { "hot_expert_activations",  moe_hot.hot_expert_activations },
+            { "cold_expert_activations", moe_hot.cold_expert_activations },
+            { "reclassify_count",        moe_hot.reclassify_count },
+            { "reclassify_time_us",      moe_hot.reclassify_time_us },
+            { "per_layer",               moe_hot_per_layer },
+        }},
+
         { "slots",                           slots_data },
     };
 }

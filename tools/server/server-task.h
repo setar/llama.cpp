@@ -543,6 +543,22 @@ struct server_task_result_metrics : server_task_result {
     uint64_t n_draft_verif_steps_total = 0;
     std::vector<uint64_t> n_accepted_per_pos_total;
 
+    uint64_t affinity_assigned[3] = {};
+    uint64_t affinity_hit[3]      = {};
+    uint64_t affinity_busy[3]     = {};
+    uint64_t affinity_evicted[3]  = {};
+
+    uint64_t checkpoint_restore_hit          = 0;
+    uint64_t checkpoint_restore_miss         = 0;
+    uint64_t checkpoint_full_prefill         = 0;
+    uint64_t checkpoint_reject_task_length   = 0;
+    uint64_t checkpoint_reject_position      = 0;
+    uint64_t checkpoint_reject_common_prefix = 0;
+    uint64_t checkpoint_restore_disk_error   = 0;
+
+    llama_moe_hot_stats moe_hot = {};
+    std::vector<int32_t> moe_hot_per_layer;
+
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
     json slots_data = json::array();

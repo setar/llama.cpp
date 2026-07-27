@@ -40,6 +40,12 @@ struct llama_memory_buffer {
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
 struct llama_context {
+    friend bool llama_get_moe_hot_stats(
+            const llama_context * ctx,
+            llama_moe_hot_stats * stats,
+            int32_t * layer_hot_counts,
+            size_t layer_hot_capacity);
+
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
             const llama_model & model,
@@ -348,6 +354,8 @@ private:
     mutable size_t  moe_mlock_ok_bytes   = 0;
     mutable size_t  moe_mlock_fail_bytes = 0;
     mutable int32_t moe_mlock_fail_errno = 0;
+    uint64_t moe_reclassify_total = 0;
+    uint64_t moe_reclassify_time_us = 0;
 
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE

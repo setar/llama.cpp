@@ -2605,7 +2605,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MLOCK"));
     add_opt(common_arg(
         {"--moe-hot-count"}, "N|auto|L0,L1,...",
-        "keep only the hottest MoE experts locked in RAM; use auto to derive per-layer counts from saved expert stats",
+        "keep only the hottest MoE experts locked in RAM; auto derives per-layer counts from saved activation stats and allocates a configured budget by activation coverage per byte",
         [](common_params & params, const std::string & value) {
             params.moe_hot_per_layer.clear();
             if (value == "auto") {
@@ -2631,7 +2631,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_HOT_COUNT"));
     add_opt(common_arg(
         {"--moe-hot-budget-mib"}, "N",
-        "maximum MiB locked for hot MoE experts in auto mode (0 = unlimited)",
+        "maximum MiB locked for hot MoE experts in auto mode (0 = unlimited); this controls residency only and does not change expert routing",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("MoE hot budget must be non-negative");

@@ -1583,9 +1583,31 @@ extern "C" {
         int32_t n_sample;   // number of sampled tokens
     };
 
+    struct llama_moe_hot_stats {
+        uint64_t budget_configured_bytes;
+        uint64_t budget_effective_bytes;
+        uint64_t locked_bytes;
+        uint64_t lock_failed_bytes;
+        uint64_t hot_expert_activations;
+        uint64_t cold_expert_activations;
+        uint64_t reclassify_count;
+        uint64_t reclassify_time_us;
+        uint32_t n_layers;
+        uint32_t n_experts;
+        uint32_t n_hot_experts;
+    };
+
     LLAMA_API struct llama_perf_context_data llama_perf_context      (const struct llama_context * ctx);
     LLAMA_API void                           llama_perf_context_print(const struct llama_context * ctx);
     LLAMA_API void                           llama_perf_context_reset(      struct llama_context * ctx);
+
+    // Returns false when MoE hot residency is disabled. If layer_hot_counts is non-NULL,
+    // copies up to layer_hot_capacity per-layer hot expert counts.
+    LLAMA_API bool llama_get_moe_hot_stats(
+            const struct llama_context * ctx,
+            struct llama_moe_hot_stats * stats,
+            int32_t * layer_hot_counts,
+            size_t layer_hot_capacity);
 
     // NOTE: the following work only with samplers constructed via llama_sampler_chain_init
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);

@@ -842,6 +842,13 @@ struct server_slot {
 //
 
 struct server_metrics {
+    enum affinity_key {
+        AFFINITY_AGENT,
+        AFFINITY_SESSION,
+        AFFINITY_SYSTEM,
+        AFFINITY_KEY_COUNT,
+    };
+
     int64_t t_start = 0;
 
     uint64_t n_prompt_tokens_processed_total = 0;
@@ -864,6 +871,19 @@ struct server_metrics {
     uint64_t n_draft_accepted_total    = 0;
     uint64_t n_draft_verif_steps_total = 0;
     std::vector<uint64_t> n_accepted_per_pos_total;
+
+    uint64_t affinity_assigned[AFFINITY_KEY_COUNT] = {};
+    uint64_t affinity_hit[AFFINITY_KEY_COUNT]      = {};
+    uint64_t affinity_busy[AFFINITY_KEY_COUNT]     = {};
+    uint64_t affinity_evicted[AFFINITY_KEY_COUNT]  = {};
+
+    uint64_t checkpoint_restore_hit          = 0;
+    uint64_t checkpoint_restore_miss         = 0;
+    uint64_t checkpoint_full_prefill         = 0;
+    uint64_t checkpoint_reject_task_length   = 0;
+    uint64_t checkpoint_reject_position      = 0;
+    uint64_t checkpoint_reject_common_prefix = 0;
+    uint64_t checkpoint_restore_disk_error   = 0;
 
     void init() {
         t_start = ggml_time_us();
@@ -1806,10 +1826,12 @@ private:
                     if (slot.agent_id == task.agent_id) {
                         if (slot.is_processing()) {
                             affinity_busy = true;
+                            metrics.affinity_busy[server_metrics::AFFINITY_AGENT]++;
                             SLT_DBG(slot, "waiting for busy agent-id mapping (%08" PRIx32 ")\n",
                                     affinity_short_hash(task.agent_id));
                         } else {
                             ret = &slot;
+                            metrics.affinity_hit[server_metrics::AFFINITY_AGENT]++;
                             SLT_INF(slot, "selected slot by agent-id (%08" PRIx32 ")\n",
                                     affinity_short_hash(task.agent_id));
                         }
@@ -1824,6 +1846,7 @@ private:
                 if (ret == nullptr && !affinity_busy && free_unassigned != nullptr) {
                     ret = free_unassigned;
                     ret->agent_id = task.agent_id;
+                    metrics.affinity_assigned[server_metrics::AFFINITY_AGENT]++;
                     SLT_INF(*ret, "assigned slot to agent-id (%08" PRIx32 ")\n",
                             affinity_short_hash(task.agent_id));
                 }
@@ -1834,10 +1857,12 @@ private:
                     if (slot.session_id == task.session_id && slot.agent_id.empty()) {
                         if (slot.is_processing()) {
                             affinity_busy = true;
+                            metrics.affinity_busy[server_metrics::AFFINITY_SESSION]++;
                             SLT_DBG(slot, "waiting for busy session-id mapping (%08" PRIx32 ")\n",
                                     affinity_short_hash(task.session_id));
                         } else {
                             ret = &slot;
+                            metrics.affinity_hit[server_metrics::AFFINITY_SESSION]++;
                             SLT_INF(slot, "selected slot by session-id (%08" PRIx32 ")\n",
                                     affinity_short_hash(task.session_id));
                         }
@@ -1852,6 +1877,7 @@ private:
                 if (ret == nullptr && !affinity_busy && free_unassigned != nullptr) {
                     ret = free_unassigned;
                     ret->session_id = task.session_id;
+                    metrics.affinity_assigned[server_metrics::AFFINITY_SESSION]++;
                     SLT_INF(*ret, "assigned slot to session-id (%08" PRIx32 ")\n",
                             affinity_short_hash(task.session_id));
                 }
@@ -1867,6 +1893,7 @@ private:
                         }
                         if (slot.system_hash == req_hash) {
                             ret = &slot;
+                            metrics.affinity_hit[server_metrics::AFFINITY_SYSTEM]++;
                             SLT_INF(slot, "selected slot by system-prompt hash (0x%016" PRIx64 ")\n", req_hash);
                             break;
                         }
@@ -1879,6 +1906,7 @@ private:
                     if (ret == nullptr && free_unassigned != nullptr) {
                         ret = free_unassigned;
                         ret->system_hash = req_hash;
+                        metrics.affinity_assigned[server_metrics::AFFINITY_SYSTEM]++;
                         SLT_INF(*ret, "assigned slot to system-prompt hash (0x%016" PRIx64 ")\n", req_hash);
                     }
                 }
@@ -2025,6 +2053,13 @@ private:
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
                 slot.prompt_clear();
+                if (!slot.agent_id.empty()) {
+                    metrics.affinity_evicted[server_metrics::AFFINITY_AGENT]++;
+                } else if (!slot.session_id.empty()) {
+                    metrics.affinity_evicted[server_metrics::AFFINITY_SESSION]++;
+                } else if (slot.system_hash != 0) {
+                    metrics.affinity_evicted[server_metrics::AFFINITY_SYSTEM]++;
+                }
                 slot.system_hash = 0;
                 slot.agent_id.clear();
                 slot.session_id.clear(); // release all sticky keys so slot can be reused
@@ -2157,26 +2192,58 @@ private:
 
         // Stamp the selected typed identity. LRU reuse evicts the previous mapping.
         if (!task.agent_id.empty()) {
-            if ((!slot.agent_id.empty() && slot.agent_id != task.agent_id) || !slot.session_id.empty()) {
+            if (!slot.agent_id.empty() && slot.agent_id != task.agent_id) {
+                metrics.affinity_evicted[server_metrics::AFFINITY_AGENT]++;
+            } else if (!slot.session_id.empty()) {
+                metrics.affinity_evicted[server_metrics::AFFINITY_SESSION]++;
+            } else if (slot.system_hash != 0) {
+                metrics.affinity_evicted[server_metrics::AFFINITY_SYSTEM]++;
+            }
+            if (slot.agent_id != task.agent_id) {
+                metrics.affinity_assigned[server_metrics::AFFINITY_AGENT]++;
+            }
+            if ((!slot.agent_id.empty() && slot.agent_id != task.agent_id) ||
+                    !slot.session_id.empty() || slot.system_hash != 0) {
                 SLT_INF(slot, "%s", "evicted affinity mapping during agent-id reassignment\n");
             }
             slot.agent_id = task.agent_id;
             slot.session_id.clear();
             slot.system_hash = 0;
         } else if (!task.session_id.empty()) {
-            if (!slot.agent_id.empty() || (!slot.session_id.empty() && slot.session_id != task.session_id)) {
+            if (!slot.agent_id.empty()) {
+                metrics.affinity_evicted[server_metrics::AFFINITY_AGENT]++;
+            } else if (!slot.session_id.empty() && slot.session_id != task.session_id) {
+                metrics.affinity_evicted[server_metrics::AFFINITY_SESSION]++;
+            } else if (slot.system_hash != 0) {
+                metrics.affinity_evicted[server_metrics::AFFINITY_SYSTEM]++;
+            }
+            if (slot.session_id != task.session_id || !slot.agent_id.empty()) {
+                metrics.affinity_assigned[server_metrics::AFFINITY_SESSION]++;
+            }
+            if (!slot.agent_id.empty() ||
+                    (!slot.session_id.empty() && slot.session_id != task.session_id) ||
+                    slot.system_hash != 0) {
                 SLT_INF(slot, "%s", "evicted affinity mapping during session-id reassignment\n");
             }
             slot.agent_id.clear();
             slot.session_id = task.session_id;
             slot.system_hash = 0;
         } else {
+            const uint64_t system_hash = task_system_hash(task);
             if (!slot.agent_id.empty() || !slot.session_id.empty()) {
+                metrics.affinity_evicted[slot.agent_id.empty()
+                    ? server_metrics::AFFINITY_SESSION : server_metrics::AFFINITY_AGENT]++;
                 SLT_INF(slot, "%s", "evicted affinity mapping for request without Claude identity\n");
+            } else if (slot.system_hash != 0 && slot.system_hash != system_hash) {
+                metrics.affinity_evicted[server_metrics::AFFINITY_SYSTEM]++;
+                SLT_INF(slot, "%s", "evicted affinity mapping during system-prompt reassignment\n");
+            }
+            if (system_hash != 0 && slot.system_hash != system_hash) {
+                metrics.affinity_assigned[server_metrics::AFFINITY_SYSTEM]++;
             }
             slot.agent_id.clear();
             slot.session_id.clear();
-            slot.system_hash = task_system_hash(task);
+            slot.system_hash = system_hash;
         }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
@@ -2941,6 +3008,27 @@ private:
                     res->n_draft_verif_steps_total = metrics.n_draft_verif_steps_total;
                     res->n_accepted_per_pos_total  = metrics.n_accepted_per_pos_total;
 
+                    for (int i = 0; i < server_metrics::AFFINITY_KEY_COUNT; ++i) {
+                        res->affinity_assigned[i] = metrics.affinity_assigned[i];
+                        res->affinity_hit[i]      = metrics.affinity_hit[i];
+                        res->affinity_busy[i]     = metrics.affinity_busy[i];
+                        res->affinity_evicted[i]  = metrics.affinity_evicted[i];
+                    }
+
+                    res->checkpoint_restore_hit          = metrics.checkpoint_restore_hit;
+                    res->checkpoint_restore_miss         = metrics.checkpoint_restore_miss;
+                    res->checkpoint_full_prefill         = metrics.checkpoint_full_prefill;
+                    res->checkpoint_reject_task_length   = metrics.checkpoint_reject_task_length;
+                    res->checkpoint_reject_position      = metrics.checkpoint_reject_position;
+                    res->checkpoint_reject_common_prefix = metrics.checkpoint_reject_common_prefix;
+                    res->checkpoint_restore_disk_error   = metrics.checkpoint_restore_disk_error;
+
+                    res->moe_hot_per_layer.resize(llama_model_n_layer(model_tgt));
+                    if (!llama_get_moe_hot_stats(ctx_tgt, &res->moe_hot,
+                            res->moe_hot_per_layer.data(), res->moe_hot_per_layer.size())) {
+                        res->moe_hot_per_layer.clear();
+                    }
+
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
                     }
@@ -3063,6 +3151,13 @@ private:
                         remove_checkpoint_file(checkpoint.filepath);
                     }
                     slot->prompt_clear();
+                    if (!slot->agent_id.empty()) {
+                        metrics.affinity_evicted[server_metrics::AFFINITY_AGENT]++;
+                    } else if (!slot->session_id.empty()) {
+                        metrics.affinity_evicted[server_metrics::AFFINITY_SESSION]++;
+                    } else if (slot->system_hash != 0) {
+                        metrics.affinity_evicted[server_metrics::AFFINITY_SYSTEM]++;
+                    }
                     slot->system_hash = 0;
                     slot->agent_id.clear();
                     slot->session_id.clear();
@@ -3742,9 +3837,18 @@ private:
                                         // slot.prompt.n_tokens() can never equal task->n_tokens(), creating
                                         // an infinite checkpoint-create/evict cycle that blocks the slot.
                                         if (cur.n_tokens > (int64_t) slot.task->n_tokens()) {
+                                            metrics.checkpoint_reject_task_length++;
+                                            SLT_TRC(slot, "checkpoint rejected: task_length (checkpoint = %" PRId64 ", task = %d)\n",
+                                                    cur.n_tokens, slot.task->n_tokens());
                                             return false;
                                         }
-                                        return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                        const bool position_ok = cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                        if (!position_ok) {
+                                            metrics.checkpoint_reject_position++;
+                                            SLT_TRC(slot, "checkpoint rejected: position (pos_min = %d, threshold = %d)\n",
+                                                    cur.pos_min, pos_min_thold);
+                                        }
+                                        return position_ok;
                                     };
 
                                     auto it = std::find_if(
@@ -3769,6 +3873,9 @@ private:
                                                 it = rit;
                                                 break;
                                             }
+                                            metrics.checkpoint_reject_common_prefix++;
+                                            SLT_TRC(slot, "checkpoint rejected: common_prefix (checkpoint = %" PRId64 ", lcp = %d)\n",
+                                                    rit->n_tokens, n_past);
                                         }
                                         if (it != slot.prompt.checkpoints.rend()) {
                                             SLT_TRC(slot, "fallback: selected checkpoint n_tokens=%" PRId64 " for task with %d tokens\n",
@@ -3782,6 +3889,7 @@ private:
                                         auto & ckpt = *it;
                                         if (ckpt.data_tgt.empty() && !ckpt.filepath.empty()) {
                                             if (!read_checkpoint_from_disk(ckpt)) {
+                                                metrics.checkpoint_restore_disk_error++;
                                                 SLT_WRN(slot, "failed to restore context checkpoint from disk: %s\n", ckpt.filepath.c_str());
                                                 do_reset = true;
                                             }
@@ -3789,6 +3897,7 @@ private:
                                     }
 
                                     if (!do_reset) {
+                                        metrics.checkpoint_restore_hit++;
                                         auto & ckpt = *it;
                                         // restore the context checkpoint
                                         ckpt.load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -3813,6 +3922,8 @@ private:
                                     }
 
                                     if (do_reset) {
+                                        metrics.checkpoint_restore_miss++;
+                                        metrics.checkpoint_full_prefill++;
                                         SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         pos_next = 0;
@@ -5015,6 +5126,74 @@ void server_routes::init_routes() {
             for (size_t i = 0; i < res_task->n_accepted_per_pos_total.size(); i++) {
                 prometheus << "llamacpp:spec_decode_num_accepted_tokens_per_pos_total{position=\""
                            << i << "\"} " << res_task->n_accepted_per_pos_total[i] << "\n";
+            }
+        }
+
+        const char * affinity_keys[] = { "agent", "session", "system" };
+        const auto write_affinity = [&](const char * name, const char * help, const uint64_t * values) {
+            prometheus << "# HELP llamacpp:" << name << " " << help << "\n"
+                       << "# TYPE llamacpp:" << name << " counter\n";
+            for (int i = 0; i < 3; ++i) {
+                prometheus << "llamacpp:" << name << "{key_type=\"" << affinity_keys[i] << "\"} "
+                           << values[i] << "\n";
+            }
+        };
+
+        write_affinity("affinity_assigned_total", "Number of new slot affinity mappings.", res_task->affinity_assigned);
+        write_affinity("affinity_hit_total",      "Number of requests routed to an existing affinity mapping.", res_task->affinity_hit);
+        write_affinity("affinity_busy_total",     "Number of routing attempts deferred because their affinity slot was busy.", res_task->affinity_busy);
+        write_affinity("affinity_evicted_total",  "Number of slot affinity mappings evicted.", res_task->affinity_evicted);
+
+        const struct {
+            const char * name;
+            const char * help;
+            uint64_t value;
+        } checkpoint_metrics[] = {
+            { "checkpoint_restore_hit_total",          "Number of successful context checkpoint restores.",              res_task->checkpoint_restore_hit },
+            { "checkpoint_restore_miss_total",         "Number of context checkpoint restore misses.",                   res_task->checkpoint_restore_miss },
+            { "checkpoint_full_prefill_total",         "Number of full-prefill fallbacks after checkpoint lookup.",       res_task->checkpoint_full_prefill },
+            { "checkpoint_reject_task_length_total",   "Number of checkpoints rejected because they exceed task length.", res_task->checkpoint_reject_task_length },
+            { "checkpoint_reject_position_total",      "Number of checkpoints rejected by the position constraint.",      res_task->checkpoint_reject_position },
+            { "checkpoint_reject_common_prefix_total", "Number of checkpoints rejected because they exceed the LCP.",     res_task->checkpoint_reject_common_prefix },
+            { "checkpoint_restore_disk_error_total",   "Number of checkpoint disk read failures during restore.",         res_task->checkpoint_restore_disk_error },
+        };
+        for (const auto & metric : checkpoint_metrics) {
+            prometheus << "# HELP llamacpp:" << metric.name << " " << metric.help << "\n"
+                       << "# TYPE llamacpp:" << metric.name << " counter\n"
+                       << "llamacpp:" << metric.name << " " << metric.value << "\n";
+        }
+
+        if (!res_task->moe_hot_per_layer.empty()) {
+            const auto & moe = res_task->moe_hot;
+            const uint64_t activations = moe.hot_expert_activations + moe.cold_expert_activations;
+            const double hot_ratio = activations > 0
+                ? (double) moe.hot_expert_activations / (double) activations : 0.0;
+            const struct {
+                const char * name;
+                const char * help;
+                const char * type;
+                double value;
+            } moe_metrics[] = {
+                { "moe_hot_budget_configured_bytes", "Configured MoE hot residency budget.", "gauge", (double) moe.budget_configured_bytes },
+                { "moe_hot_budget_effective_bytes", "Effective MoE hot residency budget after backoff.", "gauge", (double) moe.budget_effective_bytes },
+                { "moe_hot_locked_bytes", "MoE expert bytes locked by the last reclassification.", "gauge", (double) moe.locked_bytes },
+                { "moe_hot_lock_failed_bytes", "MoE expert bytes that failed to lock during the last reclassification.", "gauge", (double) moe.lock_failed_bytes },
+                { "moe_hot_experts", "Total hot experts across MoE layers.", "gauge", (double) moe.n_hot_experts },
+                { "moe_hot_activation_ratio", "Fraction of observed expert activations covered by the current hot sets.", "gauge", hot_ratio },
+                { "moe_hot_reclassify_total", "Number of MoE hot-set reclassifications.", "counter", (double) moe.reclassify_count },
+                { "moe_hot_reclassify_seconds_total", "Time spent reclassifying MoE hot sets.", "counter", (double) moe.reclassify_time_us / 1.e6 },
+            };
+            for (const auto & metric : moe_metrics) {
+                prometheus << "# HELP llamacpp:" << metric.name << " " << metric.help << "\n"
+                           << "# TYPE llamacpp:" << metric.name << " " << metric.type << "\n"
+                           << "llamacpp:" << metric.name << " " << metric.value << "\n";
+            }
+
+            prometheus << "# HELP llamacpp:moe_hot_experts_per_layer Number of hot experts selected for each layer.\n"
+                       << "# TYPE llamacpp:moe_hot_experts_per_layer gauge\n";
+            for (size_t il = 0; il < res_task->moe_hot_per_layer.size(); ++il) {
+                prometheus << "llamacpp:moe_hot_experts_per_layer{layer=\"" << il << "\"} "
+                           << res_task->moe_hot_per_layer[il] << "\n";
             }
         }
 
