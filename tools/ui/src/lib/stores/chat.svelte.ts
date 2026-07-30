@@ -12,6 +12,17 @@
  */
 
 import { CONTENT_TYPE_HEADER } from '$lib/constants';
+import { SvelteMap, SvelteSet } from 'svelte/reactivity';
+import { DatabaseService } from '$lib/services/database.service';
+import { ChatService } from '$lib/services/chat.service';
+import { STREAM_RESUME_RETRY_MS } from '$lib/constants/api-endpoints';
+import { streamIdentity } from '$lib/utils/stream-identity';
+import { getAuthHeaders } from '$lib/utils/api-headers';
+import { conversationsStore } from '$lib/stores/conversations.svelte';
+import { config } from '$lib/stores/settings.svelte';
+import { agenticStore } from '$lib/stores/agentic.svelte';
+import { mcpStore } from '$lib/stores/mcp.svelte';
+import { contextSize, isRouterMode } from '$lib/stores/server.svelte';
 import {
 	INACTIVE_CONVERSATION_STATE_MAX_AGE_MS,
 	MAX_INACTIVE_CONVERSATION_STATES,
@@ -102,6 +113,7 @@ class ChatStore {
 	private resumeRetryTimers = new SvelteMap<string, ReturnType<typeof setTimeout>>();
 	// convs whose resume waits on a model load: their loading state belongs to the retry loop,
 	// so discoverActiveStream must not treat it as a live send and bail
+	// convs whose resume waits on a model load: their loading state belongs to the retry loop
 	private resumePendingConvs = new SvelteSet<string>();
 	// in-flight discoverActiveStream guard, keyed by conv id
 	private discoveringConvs = new SvelteSet<string>();
@@ -499,6 +511,7 @@ class ChatStore {
 	 * Model frozen at send time for a stream awaiting resume, from the persisted stream state.
 	 * The load progress indicator targets it after a reload, when the message row has no model
 	 * yet and the dropdown selection may not be restored.
+	 * Model frozen at send time for a stream awaiting resume.
 	 */
 	getResumeModel(convId: string): string | null {
 		return ChatService.getStreamState(convId)?.model ?? null;
@@ -511,6 +524,7 @@ class ChatStore {
 
 		if (this.chatLoadingStates.get(convId) && !this.resumePendingConvs.has(convId)) return;
 
+		if (this.chatLoadingStates.get(convId) && !this.resumePendingConvs.has(convId)) return;
 		// concurrency guard: another discover may already be running for this conv (typical race
 		// between mount and visibilitychange on tab switch). a second concurrent fetch on the same
 		// /v1/stream would duplicate every byte into the DB message, this guard bounces it
@@ -552,6 +566,11 @@ class ChatStore {
 				this.resumePendingConvs.add(convId);
 				this.setChatLoading(convId, true);
 
+			// Probe before attaching. A router returns 503 while the owning model is loading.
+			const status = await ChatService.probeResumeStatus(streamId);
+			if (status === 503) {
+				this.resumePendingConvs.add(convId);
+				this.setChatLoading(convId, true);
 				if (!this.resumeRetryTimers.has(convId)) {
 					this.resumeRetryTimers.set(
 						convId,
@@ -582,6 +601,18 @@ class ChatStore {
 				return;
 			}
 
+				return;
+			}
+			if (this.resumePendingConvs.delete(convId) && status !== 200) {
+				this.setChatLoading(convId, false);
+			}
+			if (status === 0) {
+				return;
+			}
+			if (status !== 200) {
+				ChatService.clearStreamState(convId);
+				return;
+			}
 			await this.attachServerStream(convId, streamId);
 
 			// if attachServerStream failed (session gone, TTL expired), clear the local state to avoid retrying forever
@@ -1792,6 +1823,9 @@ class ChatStore {
 		ChatService.clearStreamState(convId);
 		const retryTimer = this.resumeRetryTimers.get(convId);
 
+		void ChatService.cancelServerStream(convId, modelForStop);
+		ChatService.clearStreamState(convId);
+		const retryTimer = this.resumeRetryTimers.get(convId);
 		if (retryTimer !== undefined) {
 			clearTimeout(retryTimer);
 			this.resumeRetryTimers.delete(convId);

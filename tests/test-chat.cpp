@@ -6955,6 +6955,32 @@ static void test_reasoning_budget_message_per_request() {
     }
 }
 
+static void test_stepfun_reasoning_effort_none() {
+    LOG_DBG("%s\n", __func__);
+    auto tmpls = read_templates("models/templates/StepFun3.5-Flash.jinja");
+
+    server_chat_params opt;
+    opt.tmpls            = std::move(tmpls);
+    opt.use_jinja        = true;
+    opt.enable_thinking  = true;
+    opt.reasoning_budget = -1;
+    opt.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+
+    json body = {
+        {"messages", json::array({json{{"role", "user"}, {"content", "hello"}}})},
+        {"reasoning_effort", "none"},
+    };
+    std::vector<raw_buffer> out_files;
+    auto llama_params = oaicompat_chat_params_parse(body, opt, out_files);
+
+    const std::string generation_prompt = llama_params.at("generation_prompt").get<std::string>();
+    assert_equals(std::string("<|im_start|>assistant\n<think>\n\n</think>\n"), generation_prompt);
+    assert_ends_with(
+        llama_params.at("prompt").get<std::string>(),
+        "<|im_start|>assistant\n<think>\n\n</think>\n");
+}
+
+
 static void test_msg_diffs_compute() {
     LOG_DBG("%s\n", __func__);
     {
@@ -7116,6 +7142,7 @@ int main(int argc, char ** argv) {
         test_template_generation_prompt();
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
+        test_stepfun_reasoning_effort_none();
         test_template_output_peg_parsers(detailed_debug);
         std::cout << "\n[chat] All tests passed!" << '\n';
     }

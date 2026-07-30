@@ -555,6 +555,9 @@ export class ChatService {
 			await fetch(`${API_STREAM.BASE}?conv_id=${encodeURIComponent(id)}`, {
 				headers: getAuthHeaders(),
 				method: 'DELETE'
+			await fetch(`${API_STREAM.BASE}?conv_id=${encodeURIComponent(id)}`, {
+				method: 'DELETE',
+				headers: getAuthHeaders()
 			});
 		} catch (e) {
 			console.warn('cancelServerStream failed:', e);
@@ -664,6 +667,7 @@ export class ChatService {
 
 		const ac = new AbortController();
 
+		const ac = new AbortController();
 		try {
 			const resp = await fetch(
 				`${API_STREAM.BASE}?conv_id=${encodeURIComponent(streamId)}&from=0`,
@@ -675,6 +679,7 @@ export class ChatService {
 
 			ac.abort();
 
+			ac.abort();
 			return resp.status;
 		} catch {
 			return 0;
@@ -694,6 +699,7 @@ export class ChatService {
 		const url = `${API_STREAM.BASE}?conv_id=${encodeURIComponent(id)}&from=${from}`;
 
 		return await fetch(url, { headers: getAuthHeaders(), method: 'GET', signal });
+		return await fetch(url, { method: 'GET', signal, headers: getAuthHeaders() });
 	}
 
 	static async preEncode(

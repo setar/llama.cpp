@@ -1,6 +1,9 @@
 {%- if not add_generation_prompt is defined -%}
   {%- set add_generation_prompt = false -%}
 {%- endif -%}
+{%- if not drop_thinking is defined -%}
+  {%- set drop_thinking = false -%}
+{%- endif -%}
 {%- if not thinking is defined -%}
   {%- if enable_thinking is defined -%}
     {%- set thinking = enable_thinking -%}

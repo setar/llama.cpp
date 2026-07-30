@@ -152,6 +152,30 @@ def test_multimodal_slot_actions():
     server.server_slots = True
     server.start()
 
+    # Loading an mmproj describes server capability; it must not prevent
+    # persistence when the selected slot actually contains text only.
+    res = server.make_request("POST", "/completions", data={
+        "id_slot": 1,
+        "cache_prompt": True,
+        "temperature": 0.0,
+        "top_k": 1,
+        "prompt": "The quick brown fox jumps over the lazy dog.",
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/slots/1?action=save", data={
+        "filename": "multimodal-text-slot.bin",
+    })
+    assert res.status_code == 200
+    n_saved = res.body["n_saved"]
+    assert n_saved > 0
+
+    res = server.make_request("POST", "/slots/0?action=restore", data={
+        "filename": "multimodal-text-slot.bin",
+    })
+    assert res.status_code == 200
+    assert res.body["n_restored"] == n_saved
+
     res = server.make_request("POST", "/completions", data={
         "id_slot": 1,
         "cache_prompt": True,
@@ -165,15 +189,14 @@ def test_multimodal_slot_actions():
     assert res.status_code == 200
 
     # The legacy slot file has no representation for mtmd_input_chunk or the
-    # media index map. Reject persistence before touching either the file or KV.
-    for action in ("save", "restore"):
-        res = server.make_request("POST", f"/slots/1?action={action}", data={
-            "filename": "multimodal-slot.bin",
-        })
-        assert res.status_code == 501
-        message = res.body["error"]["message"]
-        assert "does not preserve media chunks" in message
-        assert "erase action is supported" in message
+    # media index map. Reject saving a slot that actually contains media.
+    res = server.make_request("POST", "/slots/1?action=save", data={
+        "filename": "multimodal-slot.bin",
+    })
+    assert res.status_code == 501
+    message = res.body["error"]["message"]
+    assert "does not preserve media chunks" in message
+    assert "Pure-text slots and the erase action are supported" in message
 
     res = server.make_request("POST", "/slots/1?action=erase")
     assert res.status_code == 200

@@ -2065,7 +2065,6 @@ static json deepseek_v4_sort_tool_results(const json & messages) {
             continue;
         }
 
-        // collect a maximal run of user/tool messages - they render into one user block
         std::vector<size_t> tool_positions;
         size_t run_end = i;
         for (; run_end < adjusted.size(); run_end++) {
@@ -2105,10 +2104,6 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
                                                                  const autoparser::generation_params & inputs) {
     common_chat_params data;
 
-    // V4 uses the same DSML markup as V3.2, but names the tool call block "tool_calls"
-    // instead of "function_calls", renders tool results in tool call order and its
-    // non-thinking generation prompt ends with a bare </think> instead of an empty
-    // <think></think> pair.
     const bool is_v4 = tmpl.source().find("function_calls") == std::string::npos;
 
     std::optional<json> adjusted_messages;
@@ -2178,7 +2173,30 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto generation_prompt = p.literal(GEN_PROMPT);
-        auto end               = p.end();
+        auto end = p.end();
+
+        auto reasoning = p.eps();
+        if (extract_reasoning && inputs.enable_thinking) {
+            reasoning = p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
+        } else if (extract_reasoning) {
+            // Thinking disabled but reasoning extraction requested: V3.2 emits an
+            // empty pair, while V4 emits a bare closing tag.
+            reasoning = is_v4
+                ? p.optional(p.literal(THINK_END))
+                : p.optional(p.literal(THINK_START) + p.until(THINK_END) + p.literal(THINK_END));
+        }
+
+        if (has_response_format) {
+            auto response_format = p.rule("response-format",
+                p.literal("```json") + p.space() +
+                p.content(p.schema(p.json(), "response-format-schema", inputs.json_schema)) +
+                p.space() + p.literal("```"));
+            return generation_prompt + reasoning + response_format + end;
+        }
+
+        if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
+            return generation_prompt + reasoning + p.content(p.rest()) + end;
+        }
 
         // build tool call section first since we might need it in reasoning
         auto tool_choice = p.choice();
@@ -2260,7 +2278,7 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
                 p.literal(FC_START) + p.space() + tool_choice + p.space() + p.literal(FC_END));
         }
 
-        auto reasoning = p.eps();
+        reasoning = p.eps();
         auto reasoning_with_tc = p.eps();
         auto obligatory_tool_calls = tool_calls;
         bool allow_reasoning_with_tc = false;
@@ -3375,6 +3393,7 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         LOG_DBG("Using specialized template: MiniMax-M3\n");
         return common_chat_params_init_minimax_m3(tmpl, params);
     }
+
 
     // DeepSeek V3.2/V4 format detection: template defines dsml_token and uses it for tool calls.
     // The template source contains the token as a variable assignment, not as a literal in markup.

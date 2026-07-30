@@ -978,6 +978,28 @@ def test_anthropic_metadata():
     assert res.body["type"] == "message"
 
 
+def test_anthropic_explicit_slot():
+    """Test that the Anthropic conversion preserves explicit slot selection."""
+    server.n_slots = 2
+    server.server_slots = True
+    server.start()
+
+    res = server.make_request("POST", "/v1/messages", data={
+        "model": "test",
+        "max_tokens": 1,
+        "id_slot": 0,
+        "messages": [
+            {"role": "user", "content": "Use the explicitly selected slot"}
+        ]
+    })
+
+    assert res.status_code == 200
+    slots = server.make_request("GET", "/slots")
+    assert slots.status_code == 200
+    assert slots.body[0].get("n_prompt_tokens", 0) > 0
+    assert slots.body[1].get("n_prompt_tokens", 0) == 0
+
+
 # Compatibility tests
 
 def test_anthropic_vs_openai_different_response_format():

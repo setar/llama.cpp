@@ -2472,22 +2472,14 @@ private:
         queue_results.send(std::move(res));
     }
 
-    // Gate slot save/restore/erase on slot content (does it hold media),
-    // not model capability: a multimodal model may hold a pure-text slot.
+    // Gate slot persistence on slot content, not model capability: a
+    // multimodal model may still hold a pure-text slot.
     bool check_slot_no_media(const server_slot & slot, const int id_task) {
         if (slot.prompt.tokens.has_media()) {
-            send_error(id_task,
-                "This operation is not supported while the slot holds image/audio tokens (a pure-text prefix is supported)",
-                ERROR_TYPE_NOT_SUPPORTED);
-    // The legacy slot file contains llama KV state and a flat token array only.
-    // It cannot represent the mtmd_input_chunk objects (including their IDs,
-    // token/position spans, and encoded media) held by server_tokens.
-    bool check_slot_persistence_supported(const int id_task) {
-        if (mctx) {
             send_error(
                     id_task,
-                    "Slot save/restore is unavailable on a multimodal server because the slot file format "
-                    "does not preserve media chunks. The erase action is supported.",
+                    "Slot save is unavailable while the slot holds image/audio tokens because the slot file "
+                    "format does not preserve media chunks. Pure-text slots and the erase action are supported.",
                     ERROR_TYPE_NOT_SUPPORTED);
             return false;
         }
@@ -3036,10 +3028,6 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
-                    if (!check_slot_persistence_supported(task.id)) {
-                        break;
-                    }
-
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -3080,7 +3068,6 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
-                    if (!check_slot_persistence_supported(task.id)) break;
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {

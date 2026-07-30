@@ -44,7 +44,7 @@ private:
 void server_stream_session_manager_start();
 void server_stream_session_manager_stop();
 
-// route handler factories wired under /v1/stream/* by server.cpp
+// route handler factories wired under /v1/stream by server.cpp
 // child-side handlers for the resumable stream routes. the conv id travels in the conv_id
 // query string because it can embed a model name containing slashes (org/repo), which the
 // decoded path would split before the param is captured

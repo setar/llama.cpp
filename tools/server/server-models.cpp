@@ -1476,10 +1476,10 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
             req.headers,
             req.body,
             req.files,
-            // a detached request belongs to a replay session
-            detached
-                ? std::function<bool()>([]() { return false; })
-                : req.should_stop,
+            // a detached request belongs to a replay session that outlives the client socket:
+            // it reaches the child even when the downstream died during the load wait, the
+            // session buffer is the recipient and DELETE remains the stop
+            detached ? std::function<bool()>([]() { return false; }) : req.should_stop,
             base_params.timeout_read,
             base_params.timeout_write
             );
