@@ -1122,6 +1122,135 @@ private:
         }
     }
 
+    // sidecar bundle carrying slot->prompt.checkpoints alongside the KV snapshot,
+    // so that a restored slot can resume from a context checkpoint instead of
+    // forcing a full prompt re-processing (required for hybrid/recurrent models)
+    static constexpr uint32_t SLOT_CKPT_SIDECAR_MAGIC   = 0x50434b53; // "SKCP"
+    static constexpr uint32_t SLOT_CKPT_SIDECAR_VERSION = 1;
+
+    static std::string checkpoint_sidecar_path(const std::string & filepath) {
+        return filepath + ".ckpt";
+    }
+
+    static bool write_checkpoints_sidecar(const std::string & filepath, const std::list<common_prompt_checkpoint> & checkpoints) {
+        // materialize any checkpoints whose data lives only on disk, so the
+        // sidecar stays self-contained and does not depend on the checkpoint cache dir
+        std::list<common_prompt_checkpoint> snapshots;
+        for (const auto & cp : checkpoints) {
+            if (cp.n_tokens <= 0) {
+                // position-0 snapshot cannot yield a partial reuse — skip it
+                continue;
+            }
+            auto snapshot = cp;
+            if (snapshot.data_tgt.empty() && snapshot.data_dft.empty() && snapshot.data_spec.empty()) {
+                if (!snapshot.filepath.empty() && !read_checkpoint_from_disk(snapshot)) {
+                    SRV_WRN("failed to read context checkpoint from disk for sidecar: %s\n", snapshot.filepath.c_str());
+                    continue;
+                }
+            }
+            if (snapshot.data_tgt.empty() && snapshot.data_dft.empty() && snapshot.data_spec.empty()) {
+                continue;
+            }
+            snapshots.push_back(std::move(snapshot));
+        }
+
+        std::ofstream fout(filepath, std::ios::binary);
+        if (!fout) {
+            return false;
+        }
+
+        const uint32_t magic   = SLOT_CKPT_SIDECAR_MAGIC;
+        const uint32_t version = SLOT_CKPT_SIDECAR_VERSION;
+        const uint32_t count   = (uint32_t) snapshots.size();
+
+        fout.write(reinterpret_cast<const char *>(&magic),   sizeof(magic));
+        fout.write(reinterpret_cast<const char *>(&version), sizeof(version));
+        fout.write(reinterpret_cast<const char *>(&count),   sizeof(count));
+
+        for (const auto & cp : snapshots) {
+            const int64_t n_tokens = cp.n_tokens;
+            const int32_t id_task  = cp.id_task;
+            const int32_t pos_min  = cp.pos_min;
+            const int32_t pos_max  = cp.pos_max;
+            const uint64_t size_tgt  = cp.data_tgt.size();
+            const uint64_t size_dft  = cp.data_dft.size();
+            const uint64_t size_spec = cp.data_spec.size();
+
+            fout.write(reinterpret_cast<const char *>(&n_tokens), sizeof(n_tokens));
+            fout.write(reinterpret_cast<const char *>(&id_task),  sizeof(id_task));
+            fout.write(reinterpret_cast<const char *>(&pos_min),  sizeof(pos_min));
+            fout.write(reinterpret_cast<const char *>(&pos_max),  sizeof(pos_max));
+            fout.write(reinterpret_cast<const char *>(&size_tgt), sizeof(size_tgt));
+            fout.write(reinterpret_cast<const char *>(&size_dft), sizeof(size_dft));
+            fout.write(reinterpret_cast<const char *>(&size_spec), sizeof(size_spec));
+            fout.write(reinterpret_cast<const char *>(cp.data_tgt.data()),  cp.data_tgt.size());
+            fout.write(reinterpret_cast<const char *>(cp.data_dft.data()),  cp.data_dft.size());
+            fout.write(reinterpret_cast<const char *>(cp.data_spec.data()), cp.data_spec.size());
+        }
+
+        return fout.good();
+    }
+
+    static bool read_checkpoints_sidecar(const std::string & filepath, std::list<common_prompt_checkpoint> & out) {
+        std::ifstream fin(filepath, std::ios::binary);
+        if (!fin) {
+            return false;
+        }
+
+        uint32_t magic = 0;
+        uint32_t version = 0;
+        uint32_t count = 0;
+
+        fin.read(reinterpret_cast<char *>(&magic),   sizeof(magic));
+        fin.read(reinterpret_cast<char *>(&version), sizeof(version));
+        fin.read(reinterpret_cast<char *>(&count),   sizeof(count));
+        if (!fin || magic != SLOT_CKPT_SIDECAR_MAGIC || version != SLOT_CKPT_SIDECAR_VERSION) {
+            return false;
+        }
+
+        for (uint32_t i = 0; i < count; ++i) {
+            int64_t n_tokens = 0;
+            int32_t id_task  = -1;
+            int32_t pos_min  = 0;
+            int32_t pos_max  = 0;
+            uint64_t size_tgt  = 0;
+            uint64_t size_dft  = 0;
+            uint64_t size_spec = 0;
+
+            fin.read(reinterpret_cast<char *>(&n_tokens), sizeof(n_tokens));
+            fin.read(reinterpret_cast<char *>(&id_task),  sizeof(id_task));
+            fin.read(reinterpret_cast<char *>(&pos_min),  sizeof(pos_min));
+            fin.read(reinterpret_cast<char *>(&pos_max),  sizeof(pos_max));
+            fin.read(reinterpret_cast<char *>(&size_tgt), sizeof(size_tgt));
+            fin.read(reinterpret_cast<char *>(&size_dft), sizeof(size_dft));
+            fin.read(reinterpret_cast<char *>(&size_spec), sizeof(size_spec));
+            if (!fin) {
+                return false;
+            }
+
+            common_prompt_checkpoint cp;
+            cp.n_tokens = n_tokens;
+            cp.id_task  = id_task;
+            cp.pos_min  = pos_min;
+            cp.pos_max  = pos_max;
+            // RAM buffers are restored as the sole owner: the sidecar does not
+            // reference checkpoint-cache files of the source slot
+            cp.data_tgt.resize(size_tgt);
+            cp.data_dft.resize(size_dft);
+            cp.data_spec.resize(size_spec);
+            fin.read(reinterpret_cast<char *>(cp.data_tgt.data()),  cp.data_tgt.size());
+            fin.read(reinterpret_cast<char *>(cp.data_dft.data()),  cp.data_dft.size());
+            fin.read(reinterpret_cast<char *>(cp.data_spec.data()), cp.data_spec.size());
+            if (!fin) {
+                return false;
+            }
+
+            out.push_back(std::move(cp));
+        }
+
+        return true;
+    }
+
     void cleanup_checkpoint_files() {
         if (params_base.checkpoint_cache_dir.empty()) {
             return;
@@ -3053,6 +3182,14 @@ private:
                     const size_t token_count = tokens.size();
                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
 
+                    // carry the context checkpoints alongside the KV snapshot; a failure
+                    // here must not fail the save itself, the slot file stays valid
+                    if (nwrite > 0 && !slot->prompt.checkpoints.empty()) {
+                        if (!write_checkpoints_sidecar(checkpoint_sidecar_path(filepath), slot->prompt.checkpoints)) {
+                            SRV_WRN("failed to write checkpoint sidecar for slot %d: %s.ckpt\n", id_slot, filepath.c_str());
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -3098,6 +3235,16 @@ private:
                     tokens.resize(token_count);
                     slot->prompt.clear();
                     slot->prompt.tokens.insert(tokens);
+
+                    // restore context checkpoints carried by the slot snapshot; legacy
+                    // slot files without a sidecar restore with an empty checkpoint
+                    // list and fall back to full prompt re-processing
+                    std::list<common_prompt_checkpoint> checkpoints;
+                    if (read_checkpoints_sidecar(checkpoint_sidecar_path(filepath), checkpoints)) {
+                        slot->prompt.checkpoints = std::move(checkpoints);
+                        SRV_DBG("restored %zu context checkpoints for slot %d from %s.ckpt\n",
+                                slot->prompt.checkpoints.size(), id_slot, filepath.c_str());
+                    }
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -3829,6 +3976,16 @@ private:
                                                     cur.n_tokens, slot.task->n_tokens());
                                             return false;
                                         }
+                                        // a checkpoint computed on a longer context (e.g. restored from another
+                                        // slot's snapshot) covers tokens beyond the verified common prefix:
+                                        // the KV cache does not hold those positions, so restoring it would
+                                        // resume with a gap in the context
+                                        if (cur.n_tokens > (int64_t) n_past) {
+                                            metrics.checkpoint_reject_common_prefix++;
+                                            SLT_TRC(slot, "checkpoint rejected: common_prefix (checkpoint = %" PRId64 ", lcp = %d)\n",
+                                                    cur.n_tokens, n_past);
+                                            return false;
+                                        }
                                         const bool position_ok = cur.pos_min < pos_min_thold || cur.pos_min == 0;
                                         if (!position_ok) {
                                             metrics.checkpoint_reject_position++;
@@ -3884,11 +4041,18 @@ private:
                                     }
 
                                     if (!do_reset) {
+                                        auto & ckpt = *it;
+                                        // restore the context checkpoint; sidecar data may be from a different
+                                        // model (e.g. stale snapshot) — fall back to full prefill on mismatch
+                                        if (!ckpt.load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
+                                            !ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                                            SLT_WRN(slot, "%s", "checkpoint KV incompatible with current model, falling back to full prefill\n");
+                                            do_reset = true;
+                                        }
+                                    }
+                                    if (!do_reset) {
                                         metrics.checkpoint_restore_hit++;
                                         auto & ckpt = *it;
-                                        // restore the context checkpoint
-                                        ckpt.load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
 
