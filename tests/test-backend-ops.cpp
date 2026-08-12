@@ -7326,11 +7326,6 @@ struct test_lightning_indexer : public test_case {
     const int64_t nb; // batch size
     const int64_t ns; // num streams
     const int64_t nm; // ne[3] of mask
-    const int64_t nh;  // number of indexer heads
-    const int64_t kv;  // KV size
-    const int64_t nb;  // batch size
-    const int64_t ns;  // number of streams
-    const int64_t nm;  // mask stream dimension
 
     const ggml_type type_K;
 
@@ -7348,7 +7343,6 @@ struct test_lightning_indexer : public test_case {
         return ((2 * hsk + 2) * nh + 1) * kv * nb * ns;
     }
 
-    test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1, ggml_type type_K = GGML_TYPE_F16)
     test_lightning_indexer(
             int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256,
             int64_t nb = 128, int64_t ns = 1, int64_t nm = 1,
@@ -7380,7 +7374,6 @@ struct test_lightning_indexer : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "m") == 0) {
                 init_tensor_kq_mask(t);
             } else {
@@ -9791,7 +9784,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int bs : { 1, 512 }) {
             for (int nh : { 32, 64 }) {
                 for (auto [ns, nm] : { std::pair{1, 1}, std::pair{4, 4}, std::pair{4, 1} }) {
-                    for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {
                     for (ggml_type type_K : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0,
                                               GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0,
                                               GGML_TYPE_IQ4_NL }) {
@@ -10169,7 +10161,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int bs : { 1, 512, 2048 }) {
             for (int nh : { 32, 64 }) {
                 for (int ns : { 1, 4 }) {
-                    for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {
                     for (ggml_type type_K : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0,
                                               GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0,
                                               GGML_TYPE_IQ4_NL }) {
