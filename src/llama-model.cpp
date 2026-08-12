@@ -2365,7 +2365,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
-                    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                     if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK4_DSPARK) {
                         GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
 
@@ -2381,6 +2380,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 cparams.n_seq_max,
                                 cparams.n_ubatch,
                                 1,
+                                cparams.n_rs_seq,
                                 filter,
                                 reuse);
                     } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
@@ -3015,6 +3015,8 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
     }
 
     return (uint32_t) nelements;
+}
+
 int64_t llama_model_tensor_data_f32(const struct llama_model * model, const char * name, float * dst, int64_t n_max) {
     ggml_tensor * t = nullptr;
     for (const auto & it : model->tensors_by_name) {

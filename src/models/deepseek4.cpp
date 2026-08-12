@@ -209,10 +209,6 @@ struct dsv4_state_tensors {
     ggml_tensor * kv;
     ggml_tensor * score;
 };
-static ggml_tensor * dsv4_with_zero_dep(ggml_context * ctx, ggml_tensor * t, ggml_tensor * dep) {
-    if (dep == nullptr) {
-        return t;
-    }
 
 static dsv4_state_tensors dsv4_build_state_restore(
         ggml_context * ctx,
@@ -344,6 +340,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_sinkhorn(
     }
 
     return comb;
+}
+
+ggml_tensor * llama_model_deepseek4::graph::build_hc_weighted_sum(
+        ggml_tensor * x,
         ggml_tensor * weights) const {
     return ggml_dsv4_hc_weighted_sum(ctx0, x, weights);
 }
@@ -369,16 +369,6 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
     ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm);
     cb(mixes, "hc_mixes", il);
 
-    ggml_tensor * scale_pre  = dsv4_view_1d(ctx0, hc_scale, 1, 0);
-    ggml_tensor * scale_post = dsv4_view_1d(ctx0, hc_scale, 1, 1);
-
-    ggml_tensor * base_pre  = dsv4_view_1d(ctx0, hc_base, hc, 0);
-    ggml_tensor * base_post = dsv4_view_1d(ctx0, hc_base, hc, hc);
-
-    ggml_tensor * pre = dsv4_view_2d(ctx0, mixes, hc, nt, 0);
-    pre = dsv4_hc_affine(ctx0, pre, scale_pre, base_pre);
-    pre = ggml_sigmoid(ctx0, pre);
-    pre = ggml_scale_bias(ctx0, pre, 1.0f, hparams.dsv4_hc_eps);
     // fused: split mixes into pre/post/comb, affine + sigmoid + Sinkhorn in one op
     ggml_tensor * split = ggml_dsv4_hc_split_sinkhorn(ctx0, mixes, hc_scale, hc_base,
             hc, hparams.dsv4_hc_sinkhorn_iters, hparams.dsv4_hc_eps);
@@ -396,24 +386,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
     *post = post_view;
     cb(*post, "hc_post", il);
 
-    if (cparams.fused_dsv4_hc_comb) {
-        *comb = ggml_dsv4_hc_comb(ctx0, mixes, hc_scale, hc_base, hparams.dsv4_hc_eps,
-                (int32_t) hparams.dsv4_hc_sinkhorn_iters);
-        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_COMB, *comb, il});
-    } else {
-        ggml_tensor * scale_comb = dsv4_view_1d(ctx0, hc_scale, 1, 2);
-        ggml_tensor * base_comb  = dsv4_view_1d(ctx0, hc_base, hc*hc, 2*hc);
-
-        *comb = dsv4_view_2d(ctx0, mixes, hc*hc, nt, 2*hc);
-        *comb = dsv4_hc_affine(ctx0, *comb, scale_comb, base_comb);
-        *comb = ggml_reshape_3d(ctx0, *comb, hc, hc, nt);
-        *comb = build_hc_sinkhorn(*comb, il);
-    }
     *comb = ggml_reshape_3d(ctx0, comb_flat, hc, hc, nt);
     cb(*comb, "hc_comb", il);
 
-    ggml_tensor * result = build_hc_pre(x, pre, il);
-    return result;
+    return build_hc_weighted_sum(x, pre);
 }
 
 ggml_tensor * llama_model_deepseek4::graph::build_hc_post(
@@ -422,14 +398,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_post(
         ggml_tensor * post,
         ggml_tensor * comb,
         int il) const {
-    GGML_ASSERT(x->ne[0] == n_embd);
-    GGML_ASSERT(residual->ne[1] == hparams.dsv4_hc_mult);
-
-    if (cparams.fused_dsv4_hc_post) {
-        ggml_tensor * result = ggml_dsv4_hc_post(ctx0, x, residual, post, comb);
-        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_POST, result, il});
-        return result;
-    }
+    GGML_UNUSED(il);
 
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = x->ne[1];
@@ -437,18 +406,6 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_post(
     GGML_ASSERT(residual->ne[1] == hc);
     GGML_ASSERT(residual->ne[2] == nt);
 
-        for (int64_t src = 0; src < hc; ++src) {
-            ggml_tensor * res_src = ggml_view_2d(ctx0, residual, n_embd, nt, residual->nb[2], src*residual->nb[1]);
-            ggml_tensor * comb_src_dst = ggml_view_2d(ctx0, comb, 1, nt, comb->nb[2],
-                    dst*comb->nb[0] + src*comb->nb[1]);
-            cur = ggml_add(ctx0, cur, ggml_mul(ctx0, res_src, comb_src_dst));
-        }
-
-        cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, nt);
-        out = out ? ggml_concat(ctx0, out, cur, 1) : cur;
-    }
-
-    return out;
     // fused: out[:, dst, t] = x[:, t] * post[dst, t] + sum_src residual[:, src, t] * comb[dst, src, t]
     return ggml_dsv4_hc_expand(ctx0, x, residual, post, comb);
 }
@@ -472,7 +429,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_head(
     pre = ggml_scale_bias(ctx0, pre, 1.0f, hparams.dsv4_hc_eps);
     cb(pre, "hc_head_pre", -1);
 
-    return build_hc_pre(x, pre, -1);
+    return build_hc_weighted_sum(x, pre);
 }
 
 ggml_tensor * llama_model_deepseek4::graph::build_hca_compressed_kv_from_state(
@@ -541,44 +498,6 @@ ggml_tensor * llama_model_deepseek4::graph::build_overlap_compressed_kv_from_sta
     GGML_ASSERT(score_state->ne[0] == 2*n_embd_head);
     GGML_ASSERT(n_embd_head >= n_embd_head_rope);
 
-    kv_state    = dsv4_append_zero_row(ctx0, kv_state,    false);
-    score_state = dsv4_append_zero_row(ctx0, score_state, true);
-
-    const int64_t n_read = ratio*n_blocks;
-
-    ggml_tensor * kv_rows = ggml_get_rows(ctx0, kv_state, state_read_idxs);
-    ggml_tensor * score_rows = ggml_get_rows(ctx0, score_state, state_read_idxs);
-
-    ggml_tensor * kv_prev = ggml_cont(ctx0,
-            ggml_view_2d(ctx0, kv_rows, n_embd_head, n_read, kv_rows->nb[1], 0));
-    kv_prev = ggml_reshape_3d(ctx0, kv_prev, n_embd_head, ratio, n_blocks);
-    cb(kv_prev, name, il);
-
-    ggml_tensor * score_prev = ggml_cont(ctx0,
-            ggml_view_2d(ctx0, score_rows, n_embd_head, n_read, score_rows->nb[1], 0));
-    score_prev = ggml_reshape_3d(ctx0, score_prev, n_embd_head, ratio, n_blocks);
-    cb(score_prev, name, il);
-
-    ggml_tensor * kv_cur = ggml_cont(ctx0,
-            ggml_view_2d(ctx0, kv_rows, n_embd_head, n_read, kv_rows->nb[1],
-                n_read*kv_rows->nb[1] + ggml_row_size(kv_rows->type, n_embd_head)));
-    kv_cur = ggml_reshape_3d(ctx0, kv_cur, n_embd_head, ratio, n_blocks);
-
-    ggml_tensor * score_cur = ggml_cont(ctx0,
-            ggml_view_2d(ctx0, score_rows, n_embd_head, n_read, score_rows->nb[1],
-                n_read*score_rows->nb[1] + ggml_row_size(score_rows->type, n_embd_head)));
-    score_cur = ggml_reshape_3d(ctx0, score_cur, n_embd_head, ratio, n_blocks);
-
-    ggml_tensor * values = ggml_concat(ctx0, kv_prev, kv_cur, 1);
-    ggml_tensor * scores = ggml_concat(ctx0, score_prev, score_cur, 1);
-
-    values = ggml_cont(ctx0, ggml_permute(ctx0, values, 1, 0, 2, 3));
-    scores = ggml_cont(ctx0, ggml_permute(ctx0, scores, 1, 0, 2, 3));
-
-    ggml_tensor * weights = ggml_soft_max(ctx0, scores);
-    ggml_tensor * comp = ggml_mul(ctx0, values, weights);
-    comp = ggml_sum_rows(ctx0, comp);
-    comp = ggml_cont(ctx0, ggml_permute(ctx0, comp, 1, 0, 2, 3));
     // fused gather + per-channel softmax + weighted sum; out-of-range idxs
     // (the appended zero row in the unfused version) pad as kv = 0, score = -inf
     ggml_tensor * comp = ggml_dsv4_state_compress(ctx0, kv_state, score_state, state_read_idxs, ratio);
@@ -696,9 +615,6 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
         indexer_score = ggml_add(ctx0, indexer_score, inp_lid.kq_mask);
         cb(indexer_score, "lid_score_masked", il);
     }
-    ggml_tensor * indexer_score = ggml_lightning_indexer(
-            ctx0, indexer_q, indexer_k, indexer_weights, inp_lid.kq_mask);
-    cb(indexer_score, "lid_score_masked", il);
 
     const uint32_t n_top_k = indexer_score->ne[0] < hparams.indexer_top_k ? indexer_score->ne[0] : hparams.indexer_top_k;
     ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
@@ -1373,6 +1289,17 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         inpL = build_hc_post(cur, residual, post, comb, il);
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_last", il);
+
+        // DSpark main_hidden export: mean of the layer output over the hc axis
+        // (h.mean(dim=2) in the reference), dense for every token in the ubatch
+        if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+            ggml_tensor * mean_w = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc, n_tokens);
+            mean_w = ggml_fill(ctx0, mean_w, 1.0f/hc);
+            res->t_layer_inp[il] = build_hc_weighted_sum(inpL, mean_w);
+            cb(res->t_layer_inp[il], "dspark_main_hidden", il);
+            // side branch with no consumers — expand it into the graph explicitly
+            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+        }
     }
 
     if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
@@ -1388,18 +1315,6 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         ggml_tensor * h_nextn = cparams.embeddings_nextn_masked ? flat_out : inpL;
         cb(h_nextn, "h_nextn", -1);
         res->t_h_nextn = h_nextn;
-        cb(inpL, "l_out", il);
-
-        // DSpark main_hidden export: mean of the layer output over the hc axis
-        // (h.mean(dim=2) in the reference), dense for every token in the ubatch
-        if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
-            ggml_tensor * mean_w = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc, n_tokens);
-            mean_w = ggml_fill(ctx0, mean_w, 1.0f/hc);
-            res->t_layer_inp[il] = build_hc_weighted_sum(inpL, mean_w);
-            cb(res->t_layer_inp[il], "dspark_main_hidden", il);
-            // side branch with no consumers — expand it into the graph explicitly
-            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
-        }
     }
 
     if (inp_out_ids) {

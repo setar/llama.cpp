@@ -10980,9 +10980,6 @@ static void ggml_dsv4_hc_comb_norm_rows(float * comb, float eps) {
 }
 
 static void ggml_compute_forward_dsv4_hc_comb_f32(
-// ggml_compute_forward_dsv4_hc_split_sinkhorn
-
-void ggml_compute_forward_dsv4_hc_split_sinkhorn(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     const ggml_tensor * mixes = dst->src[0];
@@ -11015,30 +11012,6 @@ void ggml_compute_forward_dsv4_hc_split_sinkhorn(
     const float eps = ggml_get_op_params_f32(dst, 0);
     const int32_t n_iter = ggml_get_op_params_i32(dst, 1);
     GGML_ASSERT(n_iter > 0);
-    GGML_ASSERT(base->type  == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type   == GGML_TYPE_F32);
-    GGML_ASSERT(mixes->nb[0] == sizeof(float));
-    GGML_ASSERT(scale->nb[0] == sizeof(float));
-    GGML_ASSERT(base->nb[0]  == sizeof(float));
-    GGML_ASSERT(dst->nb[0]   == sizeof(float));
-
-    const int n_hc           = ggml_get_op_params_i32(dst, 0);
-    const int sinkhorn_iters = ggml_get_op_params_i32(dst, 1);
-    const float eps          = ggml_get_op_params_f32(dst, 2);
-    const int64_t mix_hc     = mixes->ne[0];
-    const int64_t n_rows     = ggml_nrows(mixes);
-
-    GGML_ASSERT(n_hc > 0 && n_hc <= 16);
-    GGML_ASSERT(sinkhorn_iters > 0);
-    GGML_ASSERT(mix_hc == (2 + n_hc) * n_hc);
-    GGML_ASSERT(ggml_nrows(dst) == n_rows);
-
-    const float * scale_data = (const float *) scale->data;
-    const float * base_data  = (const float *) base->data;
-
-    const float pre_scale  = scale_data[0];
-    const float post_scale = scale_data[1];
-    const float comb_scale = scale_data[2];
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -11089,6 +11062,66 @@ void ggml_compute_forward_dsv4_hc_split_sinkhorn(
                 const int64_t idx = idst + hc*isrc;
                 *(float *) ((char *) dst->data + idst*nbd0 + isrc*nbd1 + it*nbd2) = comb[idx];
             }
+        }
+    }
+}
+
+void ggml_compute_forward_dsv4_hc_comb(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_dsv4_hc_comb_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_dsv4_hc_split_sinkhorn
+
+void ggml_compute_forward_dsv4_hc_split_sinkhorn(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * mixes = dst->src[0];
+    const ggml_tensor * scale = dst->src[1];
+    const ggml_tensor * base  = dst->src[2];
+
+    GGML_ASSERT(mixes->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(mixes->nb[0] == sizeof(float));
+    GGML_ASSERT(scale->nb[0] == sizeof(float));
+    GGML_ASSERT(base->nb[0]  == sizeof(float));
+    GGML_ASSERT(dst->nb[0]   == sizeof(float));
+
+    const int n_hc           = ggml_get_op_params_i32(dst, 0);
+    const int sinkhorn_iters = ggml_get_op_params_i32(dst, 1);
+    const float eps          = ggml_get_op_params_f32(dst, 2);
+    const int64_t mix_hc     = mixes->ne[0];
+    const int64_t n_rows     = ggml_nrows(mixes);
+
+    GGML_ASSERT(n_hc > 0 && n_hc <= 16);
+    GGML_ASSERT(sinkhorn_iters > 0);
+    GGML_ASSERT(mix_hc == (2 + n_hc) * n_hc);
+    GGML_ASSERT(ggml_nrows(dst) == n_rows);
+
+    const float * scale_data = (const float *) scale->data;
+    const float * base_data  = (const float *) base->data;
+
+    const float pre_scale  = scale_data[0];
+    const float post_scale = scale_data[1];
+    const float comb_scale = scale_data[2];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
     const int64_t dr = (n_rows + nth - 1) / nth;
     const int64_t r0 = dr * ith;
     const int64_t r1 = std::min(r0 + dr, n_rows);
@@ -11181,26 +11214,54 @@ void ggml_compute_forward_dsv4_hc_split_sinkhorn(
     }
 }
 
-void ggml_compute_forward_dsv4_hc_comb(
-        const ggml_compute_params * params,
-        ggml_tensor * dst) {
-    const ggml_tensor * src0 = dst->src[0];
-
-    switch (src0->type) {
-        case GGML_TYPE_F32:
-            {
-                ggml_compute_forward_dsv4_hc_comb_f32(params, dst);
-            } break;
-        default:
-            {
-                GGML_ABORT("fatal error");
-            }
-    }
-}
-
 // ggml_compute_forward_dsv4_hc_pre
 
 static void ggml_compute_forward_dsv4_hc_pre_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x       = dst->src[0];
+    const ggml_tensor * weights = dst->src[1];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int64_t n_embd   = x->ne[0];
+    const int64_t hc       = x->ne[1];
+    const int64_t n_tokens = x->ne[2];
+
+    GGML_ASSERT(dst->ne[0] == n_embd);
+    GGML_ASSERT(dst->ne[1] == n_tokens);
+    GGML_ASSERT(weights->ne[0] == hc);
+    GGML_ASSERT(weights->ne[1] == n_tokens);
+
+    GGML_TENSOR_LOCALS(size_t, nbx, x,       nb);
+    GGML_TENSOR_LOCALS(size_t, nbw, weights, nb);
+    GGML_TENSOR_LOCALS(size_t, nbd, dst,     nb);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nr  = n_embd * n_tokens;
+    const int64_t dr  = (nr + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i0 = ir % n_embd;
+        const int64_t it = ir / n_embd;
+
+        float sum = 0.0f;
+        for (int64_t ih = 0; ih < hc; ++ih) {
+            const float xv = *(const float *) ((const char *) x->data       + i0*nbx0 + ih*nbx1 + it*nbx2);
+            const float wv = *(const float *) ((const char *) weights->data + ih*nbw0 + it*nbw1);
+            sum += xv * wv;
+        }
+
+        *(float *) ((char *) dst->data + i0*nbd0 + it*nbd1) = sum;
+    }
+}
+
 // ggml_compute_forward_dsv4_hc_weighted_sum
 
 void ggml_compute_forward_dsv4_hc_weighted_sum(
@@ -11344,43 +11405,6 @@ void ggml_compute_forward_dsv4_hc_post(
             {
                 GGML_ABORT("fatal error");
             }
-    GGML_ASSERT(x->type       == GGML_TYPE_F32);
-    GGML_ASSERT(weights->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type     == GGML_TYPE_F32);
-    GGML_ASSERT(x->ne[0]       == dst->ne[0]);
-    GGML_ASSERT(x->ne[1]       == weights->ne[0]);
-    GGML_ASSERT(x->ne[2]       == dst->ne[1]);
-    GGML_ASSERT(weights->ne[1] == dst->ne[1]);
-    GGML_ASSERT(x->ne[3]       == 1);
-    GGML_ASSERT(weights->ne[2] == 1);
-    GGML_ASSERT(weights->ne[3] == 1);
-    GGML_ASSERT(dst->ne[2]     == 1);
-    GGML_ASSERT(dst->ne[3]     == 1);
-
-    const int64_t n_embd   = dst->ne[0];
-    const int64_t n_hc     = x->ne[1];
-    const int64_t n_tokens = dst->ne[1];
-    const int64_t n_elem   = n_embd * n_tokens;
-
-    const int64_t i0 = (n_elem * params->ith) / params->nth;
-    const int64_t i1 = (n_elem * (params->ith + 1)) / params->nth;
-
-    const char * x_data = (const char *) x->data;
-    const char * w_data = (const char *) weights->data;
-          char * y_data = (      char *) dst->data;
-
-    for (int64_t i = i0; i < i1; ++i) {
-        const int64_t d = i % n_embd;
-        const int64_t t = i / n_embd;
-
-        float acc = 0.0f;
-        for (int64_t h = 0; h < n_hc; ++h) {
-            const float xv = *(const float *) (x_data + d*x->nb[0] + h*x->nb[1] + t*x->nb[2]);
-            const float wv = *(const float *) (w_data + h*weights->nb[0] + t*weights->nb[1]);
-            acc += xv * wv;
-        }
-
-        *(float *) (y_data + d*dst->nb[0] + t*dst->nb[1]) = acc;
     }
 }
 
@@ -12307,86 +12331,5 @@ void ggml_compute_forward_fwht(const ggml_compute_params * params, ggml_tensor *
     }
 }
 
-// ggml_compute_forward_lightning_indexer
+// (duplicate ggml_compute_forward_lightning_indexer removed)
 
-void ggml_compute_forward_lightning_indexer(
-        const ggml_compute_params * params,
-        ggml_tensor * dst) {
-
-    const ggml_tensor * q = dst->src[0];
-    const ggml_tensor * k = dst->src[1];
-    const ggml_tensor * w = dst->src[2]; // weights
-    const ggml_tensor * m = dst->src[3]; // mask
-
-    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
-    GGML_ASSERT(   q->type == GGML_TYPE_F32);
-    GGML_ASSERT(   w->type == GGML_TYPE_F32);
-    GGML_ASSERT(   m->type == GGML_TYPE_F16);
-
-    GGML_TENSOR_LOCALS(int64_t, neq,  q, ne)
-    GGML_TENSOR_LOCALS(size_t,  nbq,  q, nb)
-    GGML_TENSOR_LOCALS(int64_t, nek,  k, ne)
-    GGML_TENSOR_LOCALS(size_t,  nbk,  k, nb)
-    GGML_TENSOR_LOCALS(int64_t, new,  w, ne)
-    GGML_TENSOR_LOCALS(size_t,  nbw,  w, nb)
-    GGML_TENSOR_LOCALS(int64_t, nem,  m, ne)
-    GGML_TENSOR_LOCALS(size_t,  nbm,  m, nb)
-    GGML_TENSOR_LOCALS(int64_t, ne, dst, ne)
-    GGML_TENSOR_LOCALS(size_t,  nb, dst, nb)
-
-    GGML_ASSERT( nb0 == ggml_type_size(dst->type));
-    GGML_ASSERT(nbq0 == ggml_type_size(  q->type));
-    GGML_ASSERT(nbk0 == ggml_type_size(  k->type));
-    GGML_ASSERT(nbw0 == ggml_type_size(  w->type));
-    GGML_ASSERT(nbm0 == ggml_type_size(  m->type));
-
-    const int n_embd    = q->ne[0];
-    const int n_head    = q->ne[1];
-    const int n_tokens  = q->ne[2];
-    const int n_stream  = q->ne[3];
-    const int n_kv      = k->ne[2];
-
-    ggml_to_float_t const k_to_float = ggml_get_type_traits(k->type)->to_float;
-    GGML_ASSERT((k->type == GGML_TYPE_F32 || k_to_float) && "lightning indexer: unsupported K-type");
-
-    const int nr  = n_kv;
-    const int ith = params->ith;
-    const int nth = params->nth;
-
-    // (temporary) buffer for K converted to float
-    float * k_row_f32 = (float *) params->wdata + ith*(1*n_embd + CACHE_LINE_SIZE_F32);
-
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
-
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    for (int s = 0; s < n_stream; ++s) {
-        for (int t = 0; t < n_tokens; ++t) {
-            const float       *   w_row =       (float *) ((char *)   w->data + t*nbw1 +        s*nbw3);
-            const ggml_fp16_t *   m_row = (ggml_fp16_t *) ((char *)   m->data + t*nbm1 + (s%nem3)*nbm3);
-            float             * dst_row =       (float *) ((char *) dst->data + t*nb1  +        s*nb3 );
-            for (int ik = ir0; ik < ir1; ++ik) {
-                char * k_row = (char *) k->data + ik*nbk2 + s*nbk3;
-                if (k_to_float) {
-                    k_to_float(k_row, k_row_f32, n_embd);
-                } else {
-                    k_row_f32 = (float *) k_row;
-                }
-                float score = 0.0f;
-                for (int h = 0; h < n_head; ++h) {
-                    // dot product of q and k for head h
-                    float qk = 0.0f;
-                    const float * q_row = (float *) ((char *) q->data + h*nbq1 + t*nbq2 + s*nbq3);
-                    ggml_vec_dot_f32(n_embd, &qk, 0, q_row, 0, k_row_f32, 0, 1);
-                    // ReLU and weights (prescaled)
-                    score += MAX(qk, 0.0f) * w_row[h];
-                }
-                // apply mask
-                dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
-            }
-        }
-    }
-}

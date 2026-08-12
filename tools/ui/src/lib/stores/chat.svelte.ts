@@ -12,17 +12,6 @@
  */
 
 import { CONTENT_TYPE_HEADER } from '$lib/constants';
-import { SvelteMap, SvelteSet } from 'svelte/reactivity';
-import { DatabaseService } from '$lib/services/database.service';
-import { ChatService } from '$lib/services/chat.service';
-import { STREAM_RESUME_RETRY_MS } from '$lib/constants/api-endpoints';
-import { streamIdentity } from '$lib/utils/stream-identity';
-import { getAuthHeaders } from '$lib/utils/api-headers';
-import { conversationsStore } from '$lib/stores/conversations.svelte';
-import { config } from '$lib/stores/settings.svelte';
-import { agenticStore } from '$lib/stores/agentic.svelte';
-import { mcpStore } from '$lib/stores/mcp.svelte';
-import { contextSize, isRouterMode } from '$lib/stores/server.svelte';
 import {
 	INACTIVE_CONVERSATION_STATE_MAX_AGE_MS,
 	MAX_INACTIVE_CONVERSATION_STATES,
@@ -1820,10 +1809,6 @@ class ChatStore {
 
 		void ChatService.cancelServerStream(convId, modelForStop);
 		// an explicit stop leaves nothing to resume and kills a pending resume retry
-		ChatService.clearStreamState(convId);
-		const retryTimer = this.resumeRetryTimers.get(convId);
-
-		void ChatService.cancelServerStream(convId, modelForStop);
 		ChatService.clearStreamState(convId);
 		const retryTimer = this.resumeRetryTimers.get(convId);
 		if (retryTimer !== undefined) {

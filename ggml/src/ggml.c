@@ -1087,7 +1087,6 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_WEIGHTED_SUM",
     "DSV4_HC_EXPAND",
     "DSV4_STATE_COMPRESS",
-    "LIGHTNING_INDEXER",
 
     "UNARY",
 
@@ -1105,9 +1104,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1209,7 +1206,6 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_weighted_sum(x)",
     "dsv4_hc_expand(x)",
     "dsv4_state_compress(kv, score, idxs)",
-    "lightning_indexer(q, k, w, mask)",
 
     "unary(x)",
 
@@ -1227,9 +1223,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6361,9 +6355,6 @@ struct ggml_tensor * ggml_lightning_indexer(
 // ggml_dsv4_hc_comb
 
 struct ggml_tensor * ggml_dsv4_hc_comb(
-// ggml_dsv4_hc_split_sinkhorn
-
-struct ggml_tensor * ggml_dsv4_hc_split_sinkhorn(
         struct ggml_context * ctx,
         struct ggml_tensor  * mixes,
         struct ggml_tensor  * scale,
@@ -6405,6 +6396,20 @@ struct ggml_tensor * ggml_dsv4_hc_split_sinkhorn(
     ggml_set_op_params_i32(result, 1, n_iter);
 
     result->op     = GGML_OP_DSV4_HC_COMB;
+    result->src[0] = mixes;
+    result->src[1] = scale;
+    result->src[2] = base;
+
+    return result;
+}
+
+// ggml_dsv4_hc_split_sinkhorn
+
+struct ggml_tensor * ggml_dsv4_hc_split_sinkhorn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mixes,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * base,
         int                   n_hc,
         int                   sinkhorn_iters,
         float                 eps) {
@@ -6438,6 +6443,30 @@ struct ggml_tensor * ggml_dsv4_hc_split_sinkhorn(
     return result;
 }
 
+// ggml_dsv4_hc_weighted_sum
+
+struct ggml_tensor * ggml_dsv4_hc_weighted_sum(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * weights) {
+    GGML_ASSERT(x->type       == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(x->ne[1] == weights->ne[0]);
+    GGML_ASSERT(x->ne[2] == weights->ne[1]);
+    GGML_ASSERT(x->ne[3] == 1);
+    GGML_ASSERT(weights->ne[2] == 1);
+    GGML_ASSERT(weights->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[2]);
+
+    result->op     = GGML_OP_DSV4_HC_WEIGHTED_SUM;
+    result->src[0] = x;
+    result->src[1] = weights;
+
+    return result;
+}
+
 // ggml_dsv4_hc_pre
 
 struct ggml_tensor * ggml_dsv4_hc_pre(
@@ -6461,24 +6490,6 @@ struct ggml_tensor * ggml_dsv4_hc_pre(
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
 
     result->op     = GGML_OP_DSV4_HC_PRE;
-// ggml_dsv4_hc_weighted_sum
-
-struct ggml_tensor * ggml_dsv4_hc_weighted_sum(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * x,
-        struct ggml_tensor  * weights) {
-    GGML_ASSERT(x->type       == GGML_TYPE_F32);
-    GGML_ASSERT(weights->type == GGML_TYPE_F32);
-
-    GGML_ASSERT(x->ne[1] == weights->ne[0]);
-    GGML_ASSERT(x->ne[2] == weights->ne[1]);
-    GGML_ASSERT(x->ne[3] == 1);
-    GGML_ASSERT(weights->ne[2] == 1);
-    GGML_ASSERT(weights->ne[3] == 1);
-
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[2]);
-
-    result->op     = GGML_OP_DSV4_HC_WEIGHTED_SUM;
     result->src[0] = x;
     result->src[1] = weights;
 
@@ -6524,6 +6535,13 @@ struct ggml_tensor * ggml_dsv4_hc_post(
 
     result->op     = GGML_OP_DSV4_HC_POST;
     result->src[0] = x;
+    result->src[1] = residual;
+    result->src[2] = post;
+    result->src[3] = comb;
+
+    return result;
+}
+
 // ggml_dsv4_hc_expand
 
 struct ggml_tensor * ggml_dsv4_hc_expand(
@@ -6634,42 +6652,6 @@ struct ggml_tensor * ggml_dsv4_state_compress_flat(
     result->src[0] = kv_state;
     result->src[1] = score_state;
     result->src[2] = idxs;
-
-    return result;
-}
-
-// ggml_lightning_indexer
-
-struct ggml_tensor * ggml_lightning_indexer(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * q,
-        struct ggml_tensor  * k,
-        struct ggml_tensor  * weights,
-        struct ggml_tensor  * mask) {
-
-    GGML_ASSERT(       q->type == GGML_TYPE_F32);
-    GGML_ASSERT( weights->type == GGML_TYPE_F32);
-    GGML_ASSERT(    mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
-    GGML_ASSERT(      q->ne[0] == k->ne[0]);
-    GGML_ASSERT(   mask->ne[0] == k->ne[2]);
-    GGML_ASSERT(      q->ne[1] == weights->ne[0]);
-    GGML_ASSERT(      k->ne[1] == 1);
-    GGML_ASSERT(   mask->ne[1] == q->ne[2]);
-    GGML_ASSERT(      q->ne[2] == weights->ne[1]);
-    GGML_ASSERT(weights->ne[2] == 1);
-    GGML_ASSERT(   mask->ne[2] == 1);
-    GGML_ASSERT(      q->ne[3] == k->ne[3]);
-    GGML_ASSERT(      k->ne[3] == weights->ne[3]);
-    GGML_ASSERT(weights->ne[3] % mask->ne[3] == 0);
-
-    int64_t ne[4] = { k->ne[2], q->ne[2], 1, q->ne[3] };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
-
-    result->op   = GGML_OP_LIGHTNING_INDEXER;
-    result->src[0] = q;
-    result->src[1] = k;
-    result->src[2] = weights;
-    result->src[3] = mask;
 
     return result;
 }

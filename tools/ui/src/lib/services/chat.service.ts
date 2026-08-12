@@ -553,9 +553,6 @@ export class ChatService {
 			const id = streamIdentity(conversationId, model);
 
 			await fetch(`${API_STREAM.BASE}?conv_id=${encodeURIComponent(id)}`, {
-				headers: getAuthHeaders(),
-				method: 'DELETE'
-			await fetch(`${API_STREAM.BASE}?conv_id=${encodeURIComponent(id)}`, {
 				method: 'DELETE',
 				headers: getAuthHeaders()
 			});
@@ -667,7 +664,6 @@ export class ChatService {
 
 		const ac = new AbortController();
 
-		const ac = new AbortController();
 		try {
 			const resp = await fetch(
 				`${API_STREAM.BASE}?conv_id=${encodeURIComponent(streamId)}&from=0`,
@@ -679,7 +675,6 @@ export class ChatService {
 
 			ac.abort();
 
-			ac.abort();
 			return resp.status;
 		} catch {
 			return 0;

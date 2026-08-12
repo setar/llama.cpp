@@ -107,29 +107,6 @@ private:
     bool enabled_;
 };
 
-// Helper class to set non-causal attention via RAII
-class scope_non_causal {
-public:
-    scope_non_causal(llama_context * context, bool enabled) : context_(context), enabled_(enabled) {
-        if (enabled_) {
-            // TODO @ngxson : need to make sure only one image is processed at a time, and n_ubatch must be enough to hold the image
-            llama_set_causal_attn(context_, false);
-        }
-    }
-    ~scope_non_causal() {
-        if (enabled_) {
-            llama_set_causal_attn(context_, true);
-        }
-    }
-
-    scope_non_causal(const scope_non_causal &) = delete;
-    scope_non_causal & operator=(const scope_non_causal &) = delete;
-
-private:
-    llama_context * context_;
-    bool enabled_;
-};
-
 // Helper function for decoding an image whose embeddings have already been calculated
 int32_t mtmd_helper_decode_image_chunk(
         mtmd_context * ctx,
